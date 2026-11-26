@@ -1,114 +1,103 @@
-<p align="center">
-  <a href="https://opencode.ai">
-    <picture>
-      <source srcset=".github/assets/logo-ornate-dark.svg" media="(prefers-color-scheme: dark)">
-      <source srcset=".github/assets/logo-ornate-light.svg" media="(prefers-color-scheme: light)">
-      <img src=".github/assets/logo-ornate-light.svg" alt="OpenCode logo">
-    </picture>
-  </a>
-</p>
-<p align="center">The open source AI coding agent.</p>
-<p align="center">
-  <a href="https://opencode.ai/discord"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
-  <a href="https://www.npmjs.com/package/@opencode/cli"><img alt="npm" src="https://img.shields.io/npm/v/@opencode/cli?style=flat-square" /></a>
-  <a href="https://github.com/anomalyco/opencode/actions/workflows/release.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/anomalyco/opencode/release.yml?style=flat-square&branch=dev" /></a>
-</p>
+<h1 align="center">OpenCode Web</h1>
+
+<p align="center">A <b>web version of the OpenCode desktop app</b>, built from this repository's own source.</p>
 
 <p align="center">
-  <a href="README.md">English</a> |
-  <a href="README.zh.md">简体中文</a> |
-  <a href="README.zht.md">繁體中文</a> |
-  <a href="README.ko.md">한국어</a> |
-  <a href="README.de.md">Deutsch</a> |
-  <a href="README.es.md">Español</a> |
-  <a href="README.fr.md">Français</a> |
-  <a href="README.it.md">Italiano</a> |
-  <a href="README.da.md">Dansk</a> |
-  <a href="README.ja.md">日本語</a> |
-  <a href="README.pl.md">Polski</a> |
-  <a href="README.ru.md">Русский</a> |
-  <a href="README.bs.md">Bosanski</a> |
-  <a href="README.ar.md">العربية</a> |
-  <a href="README.no.md">Norsk</a> |
-  <a href="README.br.md">Português (Brasil)</a> |
-  <a href="README.th.md">ไทย</a> |
-  <a href="README.tr.md">Türkçe</a> |
-  <a href="README.uk.md">Українська</a> |
-  <a href="README.bn.md">বাংলা</a> |
-  <a href="README.gr.md">Ελληνικά</a> |
-  <a href="README.vi.md">Tiếng Việt</a>
+  <img src="docs/web-ui-home.png" alt="OpenCode Web — home" width="49%">
+  <img src="docs/web-ui-session.png" alt="OpenCode Web — new session" width="49%">
+</p>
+<p align="center">
+  <img src="docs/web-ui-sent.png" alt="OpenCode Web — live session streaming from the engine" width="98%">
 </p>
 
-[![OpenCode Terminal UI](services/site/public/v1/docs/assets/lander/screenshot.png)](https://opencode.ai)
+## What is this?
 
----
+The desktop app is an Electron shell around a SolidJS renderer plus the `opencode`
+engine. The renderer is platform-adaptive: without the Electron bridge it runs its
+built-in **web platform** (`packages/app/src/runtime/platform/web.ts`) and talks to
+the engine over same-origin HTTP.
 
-### Installation
+This fork keeps all upstream code untouched and adds a small, dependency-free
+Node.js shell (`server.js` at the repo root) that plays the role the Electron main
+process plays on desktop:
 
-```bash
-# YOLO
-curl -fsSL https://opencode.ai/v2/install | bash
-
-# Package managers
-npm i -g @opencode/cli@latest      # or bun/pnpm/yarn
-brew install anomalyco/tap/opencode-v2 # macOS and Linux (recommended, always up to date)
-brew install opencode              # macOS and Linux (official brew formula, updated less)
-sudo pacman -S opencode            # Arch Linux (Stable)
-paru -S opencode-beta              # Arch Linux (Latest from AUR)
-mise use -g opencode               # Any OS
-nix run github:anomalyco/opencode  # Nix
+```
+Desktop app  =  Electron main process  +  SolidJS renderer  +  opencode engine
+Web version  =  Node.js server.js      +  the same renderer  +  the same engine
 ```
 
-> [!TIP]
-> Remove versions older than 0.1.x before installing.
+It
 
-### Desktop App (BETA)
+- builds the official web UI from this repo (`bun install` + `vite build` in `packages/app`),
+- spawns `opencode serve` (the v2 API + web engine) as a sidecar and reads the server password it prints,
+- serves the UI at `/` and reverse-proxies `/api/*` — REST, SSE events, and WebSocket
+  upgrades (PTY terminals) — to the engine, injecting its Basic auth **server-side**
+  so the browser never sees a credential,
+- reports readiness at `/__status`.
 
-OpenCode is also available as a desktop application. Download it from [opencode.ai/download](https://opencode.ai/download).
+Everything you get — tabs, sessions, diffs, review, terminal panel, themes, PWA —
+is the desktop app's own UI, unmodified.
 
-| Platform              | Download                           |
-| --------------------- | ---------------------------------- |
-| macOS (Apple Silicon) | `opencode-desktop-mac-arm64.dmg`   |
-| macOS (Intel)         | `opencode-desktop-mac-x64.dmg`     |
-| Windows               | `opencode-desktop-win-x64.exe`     |
-| Linux                 | `.deb`, `.rpm`, or `.AppImage`     |
+## Run locally
 
-```bash
-# macOS (Homebrew)
-brew install --cask opencode-desktop
+```sh
+node server.js                       # http://localhost:8080
 ```
 
-#### Installation Directory
+Requires Node >= 18, a built UI (`bun install && bun run --cwd packages/app build`,
+copy `packages/app/dist` next to `server.js` as `web/`) and the engine
+(`./engine/opencode`, or any `opencode` on `PATH` via `ENGINE_BIN`).
+Without a `web/` directory, `server.js` serves the engine's embedded web build instead.
 
-The install script installs OpenCode to `$HOME/.opencode/bin`.
+## Deploy (Docker)
 
-### Agents
+The root `Dockerfile` does everything — builds the UI from source, downloads the
+engine from the official 2.4.2 package, and runs the server:
 
-OpenCode includes two built-in agents you can switch between with the `Tab` key.
+```sh
+docker build -t opencode-web .
+docker run -p 8080:8080 -v "$PWD/my-project:/workspace" opencode-web
+```
 
-- **build** - Default, full-access agent for development work
-- **plan** - Read-only agent for analysis and code exploration
-  - Denies file edits by default
-  - Asks permission before running bash commands
-  - Ideal for exploring unfamiliar codebases or planning changes
+The agent operates on `/workspace` (override with `OPENCODE_PROJECT_DIR`).
 
-Also included is a **general** subagent for complex searches and multistep tasks.
-This is used internally and can be invoked using `@general` in messages.
+## Deploy to running.sh
 
-Learn more about [agents](https://opencode.ai/docs/agents).
+The repo deploys as-is (the Dockerfile is detected and built as a container).
+Sizes: the free `lite` instance is enough — the server + engine idle comfortably
+below its memory; the container wakes from sleep in about a second.
 
-### Documentation
+```sh
+# project + service (public repo, no GitHub App needed)
+curl -X POST -H "Authorization: Bearer $RUNNING_TOKEN" https://running.sh/api/v1/projects \
+  -d '{"workspaceId":"'$WS'","name":"opencode-web"}'
+curl -X POST -H "Authorization: Bearer $RUNNING_TOKEN" \
+  https://running.sh/api/v1/projects/$P/services \
+  -d '{"name":"web","source":{"type":"github","repo":"OWNER/opencode","branch":"dev"}}'
+```
 
-For more info on how to configure OpenCode, [**head over to our docs**](https://opencode.ai/docs).
+Configuration (environment variables for `server.js`):
 
-### Contributing
+| Variable               | Default             | Meaning                                     |
+| ---------------------- | ------------------- | ------------------------------------------- |
+| `PORT` / `HOST`        | `8080` / `0.0.0.0`  | Where the web app listens                   |
+| `ENGINE_BIN`           | `./engine/opencode` | Engine binary (falls back to `opencode` on PATH) |
+| `ENGINE_PORT`          | random free port    | Fixed engine port                           |
+| `OPENCODE_PROJECT_DIR` | current directory   | The project the agent works on              |
+| `WEB_DIR`              | `./web`             | Built renderer directory                    |
 
-If you're interested in contributing to OpenCode, please read our [contributing docs](./CONTRIBUTING.md) before submitting a pull request.
+## Using the app
 
-### Building on OpenCode
+1. Open the app — Home shows projects and recent sessions, like the desktop app.
+2. **New session** — the composer supports `/` commands, `@` context mentions,
+   image attachments and agent selection (Build / Plan / Big Pickle).
+3. The engine is the real OpenCode v2 engine: sign in to a provider
+   (`engine/opencode auth login` or an `opencode.json` in the project directory)
+   and sessions run models. Without a provider the UI works end to end, but the
+   agent has nothing to call.
 
-If you are working on a project that's related to OpenCode and is using "opencode" as part of its name, for example "opencode-dashboard" or "opencode-mobile", please add a note to your README to clarify that it is not built by the OpenCode team and is not affiliated with us in any way.
+## Credits & license
 
----
-
-**Join our community** [Discord](https://discord.gg/opencode) | [X.com](https://x.com/opencode)
+All upstream code is [OpenCode](https://github.com/anomalyco/opencode) by
+[Anomaly](https://anomaly.co) — MIT licensed. The additions in this fork
+(`server.js`, `Dockerfile`, docs) are MIT as well.
