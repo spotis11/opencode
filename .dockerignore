@@ -1,12 +1,8 @@
 .git
-.opencode
-.sst
-.turbo
-.wrangler
+.github
 node_modules
 **/node_modules
-**/.output
-**/dist
-**/.turbo
-**/.vite
-**/coverage
+packages/app/dist
+*.log
+logs
+docs
