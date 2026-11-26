@@ -10,9 +10,11 @@
 # /api/* to the engine with server-side authentication.
 #
 # Engine state (sessions, auth, config — SQLite + JSON under opencode/) is
-# redirected to /data via XDG env vars so it lands on the attached disk
-# volume: it survives sleep/wake and crashes. A deploy resets the disk, so
-# snapshot the volume before deploying and restore the snapshot afterwards.
+# redirected to /data via XDG env vars. On running.sh the lite instance
+# (256 MiB) cannot carry a volume — volumes force the full-size instance —
+# so /data is the container's writable layer, and persistence across deploys
+# is handled by snapshotting /data before a deploy and restoring it after
+# (see scripts/persist-snapshot.sh).
 
 FROM oven/bun:1.3 AS build
 WORKDIR /src
@@ -43,7 +45,9 @@ ENV HOST=0.0.0.0 \
     OPENCODE_PROJECT_DIR=/workspace \
     XDG_DATA_HOME=/data/xdg/data \
     XDG_CONFIG_HOME=/data/xdg/config \
-    XDG_CACHE_HOME=/tmp/xdg/cache
+    XDG_CACHE_HOME=/tmp/xdg/cache \
+    NODE_OPTIONS=--max-old-space-size=64 \
+    BUN_JSC_forceRAMSize=134217728
 RUN mkdir -p /workspace /data/xdg/data /data/xdg/config /tmp/xdg/cache
 EXPOSE 8080
 CMD ["node", "/app/server.js"]
