@@ -45,9 +45,7 @@ ENV HOST=0.0.0.0 \
     OPENCODE_PROJECT_DIR=/workspace \
     XDG_DATA_HOME=/data/xdg/data \
     XDG_CONFIG_HOME=/data/xdg/config \
-    XDG_CACHE_HOME=/tmp/xdg/cache \
-    NODE_OPTIONS=--max-old-space-size=64 \
-    BUN_JSC_forceRAMSize=134217728
+    XDG_CACHE_HOME=/tmp/xdg/cache
 RUN mkdir -p /workspace /data/xdg/data /data/xdg/config /tmp/xdg/cache
 EXPOSE 8080
 CMD ["node", "/app/server.js"]
