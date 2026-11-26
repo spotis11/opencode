@@ -64,8 +64,11 @@ The agent operates on `/workspace` (override with `OPENCODE_PROJECT_DIR`).
 ## Deploy to running.sh
 
 The repo deploys as-is (the Dockerfile is detected and built as a container).
-Sizes: the free `lite` instance is enough — the server + engine idle comfortably
-below its memory; the container wakes from sleep in about a second.
+**Size: use `standard-1` or bigger** — the `lite` instance's 256 MiB cannot hold
+the Node proxy plus the Bun-compiled engine at the same time; no matter the
+memory caps, a lite container serves fine for about a minute and a half and
+then gets OOM-killed (SIGKILL 137) in a loop. `standard-1` with
+`alwaysOn: false` sleeps when idle and only costs compute while it is awake.
 
 ```sh
 # project + service (public repo, no GitHub App needed)
@@ -75,6 +78,22 @@ curl -X POST -H "Authorization: Bearer $RUNNING_TOKEN" \
   https://running.sh/api/v1/projects/$P/services \
   -d '{"name":"web","source":{"type":"github","repo":"OWNER/opencode","branch":"dev"}}'
 ```
+
+### Keeping state across deploys
+
+A deploy resets the container filesystem, which would wipe the engine's
+sessions, auth logins and config (`opencode.db` under the XDG dirs).
+`server.js` therefore exposes two endpoints, gated by a `PERSIST_TOKEN`
+secret (set it as an encrypted service variable):
+
+- `GET /__persist/dump` — stops the engine for a consistent snapshot, tars
+  `/data/xdg`, restarts the engine, streams the archive;
+- `POST /__persist/restore` — extracts an uploaded archive and restarts the
+  engine so the database reloads.
+
+`scripts/persist-snapshot.sh save | restore | deploy` wraps the whole ritual
+(save → deploy via the API → restore → verify). Verified end to end: a session
+created before a deploy is still there after it.
 
 Configuration (environment variables for `server.js`):
 
