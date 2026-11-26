@@ -1,16 +1,23 @@
 # OpenCode Web — web version of the OpenCode desktop app.
 #
-# Build stage: compiles the official web renderer (packages/app) from this
-# repository's source with Bun + Vite (this is the same code the desktop app
-# uses; the web entry in packages/app/src/entry.tsx).
+# Build stage: compiles the official web renderer (packages/app) with Bun + Vite.
+# The renderer source is pinned to the same release as the engine binary
+# (v2.4.2): a newer dev-branch renderer calls /api routes the engine doesn't
+# have yet — those 404 and the web client then thrashes its request queue.
 #
 # Runtime stage: Node.js + the opencode engine (extracted from the official
 # desktop Linux package) managed by server.js, which hosts the UI and proxies
 # /api/* to the engine with server-side authentication.
+#
+# Engine state (sessions, auth, config — SQLite + JSON under opencode/) is
+# redirected to /data via XDG env vars so it lands on the attached disk
+# volume: it survives sleep/wake and crashes. A deploy resets the disk, so
+# snapshot the volume before deploying and restore the snapshot afterwards.
 
 FROM oven/bun:1.3 AS build
 WORKDIR /src
-COPY . .
+RUN curl -fsSL -o src.tgz https://github.com/anomalyco/opencode/archive/refs/tags/v2.4.2.tar.gz \
+ && tar -xzf src.tgz --strip-components=1
 RUN bun install --frozen-lockfile
 RUN cd packages/app && bun run build
 
@@ -32,7 +39,10 @@ COPY --from=build /src/packages/app/dist /app/web
 COPY server.js /app/server.js
 ENV HOST=0.0.0.0 \
     PORT=8080 \
-    OPENCODE_PROJECT_DIR=/workspace
-RUN mkdir -p /workspace
+    OPENCODE_PROJECT_DIR=/workspace \
+    XDG_DATA_HOME=/data/xdg/data \
+    XDG_CONFIG_HOME=/data/xdg/config \
+    XDG_CACHE_HOME=/tmp/xdg/cache
+RUN mkdir -p /workspace /data/xdg/data /data/xdg/config /tmp/xdg/cache
 EXPOSE 8080
 CMD ["node", "/app/server.js"]
