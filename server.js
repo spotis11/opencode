@@ -51,6 +51,9 @@ const ENGINE_PORT = process.env.ENGINE_PORT ? Number(process.env.ENGINE_PORT) : 
 // Working directory the engine operates on (the project the agent edits).
 const PROJECT_DIR = process.env.OPENCODE_PROJECT_DIR || process.cwd()
 const LOG_DIR = path.join(__dirname, "logs")
+// XDG root for engine state; on running.sh this is /data (container writable
+// layer — a deploy resets it, use the /__persist endpoints around deploys).
+const DATA_DIR = process.env.PERSIST_DIR || path.dirname(path.dirname(process.env.XDG_DATA_HOME || "/data/xdg/data"))
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -214,6 +217,86 @@ function stopEngine() {
 }
 
 // ---------------------------------------------------------------------------
+// Engine-state persistence (deploy-time snapshot / restore)
+//
+// The engine keeps sessions, auth and config as SQLite + JSON under its XDG
+// dirs (DATA_DIR/xdg on the container filesystem). Container filesystems do
+// not survive a deploy, so before deploying, `scripts/persist-snapshot.sh`
+// saves this state over GET /__persist/dump and restores it after the deploy
+// over POST /__persist/restore (which restarts the engine so it reloads the
+// database). Both endpoints require the PERSIST_TOKEN secret header.
+// ---------------------------------------------------------------------------
+
+const PERSIST_TOKEN = process.env.PERSIST_TOKEN || ""
+const PERSIST_DIR = DATA_DIR
+
+function persistAllowed(req) {
+  return Boolean(PERSIST_TOKEN) && req.headers["x-persist-token"] === PERSIST_TOKEN
+}
+
+function restartEngine() {
+  stopEngine()
+  return new Promise((resolve) => {
+    const wait = () => {
+      if (!engine.child || engine.child.exitCode !== null) {
+        startEngine()
+        resolve()
+      } else {
+        setTimeout(wait, 250)
+      }
+    }
+    wait()
+  })
+}
+
+function persistDump(res) {
+  res.writeHead(200, { "content-type": "application/gzip" })
+  if (!fs.existsSync(path.join(PERSIST_DIR, "xdg"))) return res.end(Buffer.alloc(0))
+  const tar = spawn("tar", ["czf", "-", "-C", PERSIST_DIR, "xdg"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  tar.stdout.pipe(res)
+  tar.stderr.on("data", (c) => log("dump:", c.toString().slice(0, 200)))
+  tar.on("error", () => res.end())
+}
+
+async function persistRestore(req, res) {
+  try {
+    const tmp = path.join(os.tmpdir(), "persist-restore.tgz")
+    const ws = fs.createWriteStream(tmp)
+    await new Promise((ok, err) => {
+      req.pipe(ws)
+      ws.on("finish", ok)
+      ws.on("error", err)
+    })
+    const size = fs.statSync(tmp).size
+    if (size > 0) {
+      fs.mkdirSync(PERSIST_DIR, { recursive: true })
+      await new Promise((ok, err) => {
+        const tar = spawn("tar", ["xzf", tmp, "-C", PERSIST_DIR], {
+          stdio: ["ignore", "ignore", "pipe"],
+        })
+        let msg = ""
+        tar.stderr.on("data", (c) => (msg += c))
+        tar.on("exit", (code) => (code === 0 ? ok() : err(new Error(`tar exit ${code}: ${msg.slice(0, 200)}`))))
+        tar.on("error", err)
+      })
+    } else {
+      log("restore: empty payload, nothing to extract")
+    }
+    fs.unlink(tmp, () => {})
+    log(`restored engine state (${size} bytes) — restarting engine`)
+    await restartEngine()
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ restored: size, engineRestarted: true }))
+  } catch (err) {
+    log(`restore failed: ${err.message}`)
+    res.writeHead(500, { "content-type": "application/json" })
+    res.end(JSON.stringify({ error: err.message }))
+  }
+}
+
+// ---------------------------------------------------------------------------
 // /api/* proxy — REST + SSE (streaming) with server-side Basic auth
 // ---------------------------------------------------------------------------
 
@@ -357,6 +440,7 @@ function serveStatus(res) {
         },
         webDir: path.basename(WEB_DIR),
         projectDir: PROJECT_DIR,
+        persist: Boolean(PERSIST_TOKEN),
         host: os.hostname(),
       },
       null,
@@ -385,6 +469,20 @@ function serveSplash(res) {
 }
 
 const server = http.createServer((req, res) => {
+  if (req.url === "/__persist/dump" && req.method === "GET") {
+    if (!persistAllowed(req)) {
+      res.writeHead(403, { "content-type": "application/json" })
+      return res.end(JSON.stringify({ error: "forbidden" }))
+    }
+    return persistDump(res)
+  }
+  if (req.url === "/__persist/restore" && req.method === "POST") {
+    if (!persistAllowed(req)) {
+      res.writeHead(403, { "content-type": "application/json" })
+      return res.end(JSON.stringify({ error: "forbidden" }))
+    }
+    return persistRestore(req, res)
+  }
   if (req.url.startsWith("/__status")) return serveStatus(res)
   if (req.url === "/api" || req.url.startsWith("/api/")) {
     if (!engine.ready) {
