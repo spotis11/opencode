@@ -193,10 +193,39 @@ function startEngine() {
     })
 
     const markReady = async () => {
-      const up = await pollReady(`${engineBase()}/`, 30000)
-      engine.ready = up
-      if (up) log(`engine ready at ${engineBase()} (password ${sawPassword ? "captured" : "not required"})`)
-      else log(`engine did not become ready in time; check ${LOG_DIR}/engine.log`)
+      // Poll in cycles; a stuck or slow boot self-heals: after ~45s without
+      // readiness the engine is restarted once, and polling continues for up
+      // to 10 minutes so a late boot never leaves a stale not-ready flag.
+      const deadline = Date.now() + 10 * 60_000
+      let restarts = 0
+      let cycles = 0
+      while (Date.now() < deadline && engine.child === child) {
+        cycles++
+        const up = await pollReady(`${engineBase()}/`, 15000, 500)
+        if (up) {
+          engine.ready = true
+          log(`engine ready at ${engineBase()} (password ${sawPassword ? "captured" : "not required"})`)
+          return
+        }
+        if (engine.child !== child) return
+        if (cycles >= 3 && restarts < 1) {
+          restarts++
+          log("engine not ready after 45s — restarting it once")
+          stopEngine()
+          await new Promise((ok) => {
+            const w = () =>
+              !engine.child || engine.child.exitCode !== null ? ok() : setTimeout(w, 200)
+            w()
+          })
+          if (engine.child === child) startEngine()
+          return // the new child runs its own markReady loop
+        }
+        log(`engine still starting (cycle ${cycles})…`)
+      }
+      if (engine.child === child) {
+        engine.ready = false
+        log(`engine did not become ready in time; check ${LOG_DIR}/engine.log`)
+      }
     }
     markReady()
 
@@ -249,15 +278,50 @@ function restartEngine() {
   })
 }
 
-function persistDump(res) {
-  res.writeHead(200, { "content-type": "application/gzip" })
-  if (!fs.existsSync(path.join(PERSIST_DIR, "xdg"))) return res.end(Buffer.alloc(0))
-  const tar = spawn("tar", ["czf", "-", "-C", PERSIST_DIR, "xdg"], {
-    stdio: ["ignore", "pipe", "pipe"],
-  })
-  tar.stdout.pipe(res)
-  tar.stderr.on("data", (c) => log("dump:", c.toString().slice(0, 200)))
-  tar.on("error", () => res.end())
+async function persistDump(res) {
+  try {
+    const hadState = fs.existsSync(path.join(PERSIST_DIR, "xdg"))
+    const wasRunning = Boolean(engine.child && engine.child.exitCode === null)
+    if (!hadState) {
+      res.writeHead(200, { "content-type": "application/gzip" })
+      return res.end(Buffer.alloc(0))
+    }
+    if (wasRunning) {
+      log("dump: stopping engine for a consistent snapshot")
+      stopEngine()
+      await new Promise((ok) => {
+        const w = () =>
+          !engine.child || engine.child.exitCode !== null ? ok() : setTimeout(w, 200)
+        w()
+      })
+    }
+    try {
+      const tmp = path.join(os.tmpdir(), "persist-dump.tgz")
+      await new Promise((ok, err) => {
+        const tar = spawn("tar", ["czf", tmp, "-C", PERSIST_DIR, "xdg"], {
+          stdio: ["ignore", "ignore", "pipe"],
+        })
+        let msg = ""
+        tar.stderr.on("data", (c) => (msg += c))
+        tar.on("exit", (code) => (code === 0 ? ok() : err(new Error(`tar exit ${code}: ${msg.slice(0, 200)}`))))
+        tar.on("error", err)
+      })
+      if (wasRunning) startEngine()
+      const stream = fs.createReadStream(tmp)
+      res.writeHead(200, { "content-type": "application/gzip" })
+      stream.pipe(res)
+      stream.on("close", () => fs.unlink(tmp, () => {}))
+    } catch (err) {
+      if (wasRunning) startEngine()
+      throw err
+    }
+  } catch (err) {
+    log(`dump failed: ${err.message}`)
+    if (!res.headersSent) {
+      res.writeHead(500, { "content-type": "application/json" })
+    }
+    res.end(JSON.stringify({ error: err.message }))
+  }
 }
 
 async function persistRestore(req, res) {
