@@ -20,12 +20,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl binutils xz-utils \
  && rm -rf /var/lib/apt/lists/*
 # Engine: `opencode serve` (v2 API + web server), from the official desktop .deb.
+# dpkg archives store members as ./opt/..., so extract everything and locate the binary.
 RUN curl -fsSL -o /tmp/opencode.deb https://opencode.ai/files/bin/2.4.2/opencode-desktop-linux-amd64.deb \
  && cd /tmp \
  && ar x opencode.deb \
- && tar -xJf data.tar.xz -C /tmp opt/OpenCode/resources/opencode-cli \
- && install -m 0755 /tmp/opt/OpenCode/resources/opencode-cli /app/engine/opencode \
- && rm -rf /tmp/* /tmp/opt
+ && mkdir -p /app/engine /tmp/oc \
+ && for f in /tmp/data.tar.*; do tar -xf "$f" -C /tmp/oc; done \
+ && install -m 0755 "$(find /tmp/oc -type f -name opencode-cli | head -1)" /app/engine/opencode \
+ && rm -rf /tmp/oc /tmp/opencode.deb /tmp/data.tar.* /tmp/control.tar.* /tmp/debian-binary
 COPY --from=build /src/packages/app/dist /app/web
 COPY server.js /app/server.js
 ENV HOST=0.0.0.0 \
