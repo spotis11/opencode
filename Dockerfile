@@ -16,8 +16,9 @@
 
 FROM oven/bun:1.3 AS build
 WORKDIR /src
-RUN curl -fsSL -o src.tgz https://github.com/anomalyco/opencode/archive/refs/tags/v2.4.2.tar.gz \
- && tar -xzf src.tgz --strip-components=1
+# The bun image has no curl/wget — ADD fetches the tarball itself.
+ADD https://github.com/anomalyco/opencode/archive/refs/tags/v2.4.2.tar.gz /tmp/src.tgz
+RUN tar -xzf /tmp/src.tgz --strip-components=1
 RUN bun install --frozen-lockfile
 RUN cd packages/app && bun run build
 
