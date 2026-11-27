@@ -521,23 +521,6 @@ export function ComposerEditor(props: ComposerEditorProps) {
                         control={control}
                         class={control.current() === "default" ? "composer-variant-default" : undefined}
                       />
-                      {/* A one-click way back: clears the effort override without opening the menu. */}
-                      <Show when={control.current() !== "default"}>
-                        <Tooltip placement="top" value={i18n.t("ui.promptInput.resetVariant")}>
-                          <Button
-                            data-action="composer-variant-reset"
-                            variant="ghost-muted"
-                            size="normal"
-                            style={{ height: "28px" }}
-                            class="![font-weight:440] text-v2-text-text-faint"
-                            aria-label={i18n.t("ui.promptInput.resetVariant")}
-                            onMouseDown={(event: MouseEvent) => event.preventDefault()}
-                            onClick={() => control.onSelect("default")}
-                          >
-                            (reset)
-                          </Button>
-                        </Tooltip>
-                      </Show>
                     </Show>
                   )}
                 </Show>
@@ -555,6 +538,10 @@ export function ComposerEditor(props: ComposerEditorProps) {
                   )}
                 </Show>
               </Show>
+              {/* Usage reset (olliecode): zeroes the engine's local usage counters —
+                  cost and token totals on every session — without touching any
+                  conversation. Present on every tab, current and new. */}
+              <ComposerUsageResetButton />
             </div>
           </div>
           <Show when={!touch()}>
@@ -1614,6 +1601,50 @@ function ComposerEditorSubmitButton(props: {
 // The composer's actions on a touch device, where Return only adds a line: this bar is the one way to send, steer,
 // queue or stop, and every target is at least 44px. Docked, it spans the bottom of the shell, which is the top of the
 // keyboard while one is open. Buttons keep the editor focused so the keyboard stays open.
+// olliecode's usage-reset pill, as a composer button. Posts to the web shell's
+// /__reset-usage endpoint, which zeroes the engine's local usage accounting
+// (cost + token aggregates on every session, plus the usage event rows) while
+// keeping every conversation. The page reloads on success so the UI re-reads
+// the zeroed counters from the engine.
+function ComposerUsageResetButton() {
+  const [state, setState] = createSignal<"idle" | "running" | "done" | "failed">("idle")
+  const [error, setError] = createSignal("")
+  let timer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => window.clearTimeout(timer))
+  const trigger = async () => {
+    if (state() === "running") return
+    setState("running")
+    setError("")
+    try {
+      const res = await fetch("/__reset-usage", { method: "POST" })
+      const body = (await res.json().catch(() => null)) as { ok?: boolean; error?: string } | null
+      if (!res.ok || !body?.ok) throw new Error(body?.error || `HTTP ${res.status}`)
+      setState("done")
+      timer = setTimeout(() => window.location.reload(), 1200)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "reset failed")
+      setState("failed")
+      timer = setTimeout(() => setState("idle"), 6000)
+    }
+  }
+  const label = () =>
+    state() === "running" ? "resetting…" : state() === "done" ? "reset ✓" : state() === "failed" ? "retry" : "reset"
+  return (
+    <button
+      type="button"
+      data-action="composer-usage-reset"
+      title={error() || "Reset usage counters to zero — conversations are kept"}
+      aria-label="Reset usage counters to zero — conversations are kept"
+      aria-busy={state() === "running"}
+      onClick={trigger}
+      class="me-1 inline-flex h-[28px] shrink-0 items-center rounded-full bg-black px-3 text-[11px] leading-4 font-[530] text-white shadow-sm transition-opacity duration-150 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-v2-border-border-focus disabled:cursor-wait"
+      classList={{ "opacity-70": state() === "running", "opacity-90": state() !== "running" }}
+    >
+      <span class="whitespace-nowrap">{label()}</span>
+    </button>
+  )
+}
+
 function ComposerEditorTouchBar(props: { controller: ComposerEditorModel; docked?: boolean }) {
   const i18n = useI18n()
   const view = props.controller.view
