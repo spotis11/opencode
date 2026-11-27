@@ -34,21 +34,22 @@ MODELS="qwen2.5-coder:1.5b:1050000 llama3.2:3b:2100000 qwen2.5-coder:7b:4900000"
 (
   have="$(ollama ls 2>/dev/null | awk '{print $1}')"
   for entry in $MODELS; do
-    m="${entry%%:*}"
-    rest="${entry#*:}"
-    need_kb="${rest##*:}"
+    # entry = name:tag:sizeKB — the model id spans the first TWO colon fields
+    # (a bare `${entry%%:*}` would strip the tag too, pulling ":latest" by accident).
+    tag="$(printf '%s' "$entry" | cut -d: -f1-2)"
+    need_kb="$(printf '%s' "$entry" | cut -d: -f3)"
     case " $have " in
-      *" $m "*) continue ;;
+      *" $tag "*) continue ;;
     esac
     free_kb="$(df -Pk /var/lib/ollama 2>/dev/null | awk 'NR==2 {print $4}')"
     if [ "${free_kb:-0}" -lt "$((need_kb + 1048576))" ]; then
-      echo "[entrypoint] skip $m — only ${free_kb}KB free on the models disk (need ~${need_kb}KB + headroom)"
+      echo "[entrypoint] skip $tag — only ${free_kb}KB free on the models disk (need ~${need_kb}KB + headroom)"
       continue
     fi
-    if ollama pull "$m" >"/tmp/ollama-pull.log" 2>&1; then
-      echo "[entrypoint] pulled $m"
+    if ollama pull "$tag" >"/tmp/ollama-pull.log" 2>&1; then
+      echo "[entrypoint] pulled $tag"
     else
-      echo "[entrypoint] WARNING: pull $m failed (see /tmp/ollama-pull.log)"
+      echo "[entrypoint] WARNING: pull $tag failed (see /tmp/ollama-pull.log)"
     fi
   done
 ) &
