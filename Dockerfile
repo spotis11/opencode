@@ -53,9 +53,10 @@ RUN curl -fsSL -o /tmp/opencode.deb https://opencode.ai/files/bin/2.4.2/opencode
  && rm -rf /tmp/oc /tmp/opencode.deb /tmp/data.tar.* /tmp/control.tar.* /tmp/debian-binary
 # Local models: Ollama runs inside this container (CPU-only — the GPU backend
 # libraries are stripped to keep the image small). The image stays lean by
-# NOT baking the weights in: they are pulled on first boot by entrypoint.sh
-# into /data/ollama/models (the persistent volume), so the builder never has
-# to export a multi-GB image and no provider meters any usage.
+# NOT baking the weights in: entrypoint.sh pulls them on first boot into
+# /var/lib/ollama/models. That is the container's main disk (~18 GB free) —
+# /data, by contrast, is only a 1 GB persistent volume (engine state), which
+# models would blow through instantly. No provider meters any usage.
 RUN curl -fsSL -o /tmp/ollama.tar.zst https://github.com/ollama/ollama/releases/download/v0.40.18/ollama-linux-amd64.tar.zst \
  && mkdir -p /tmp/ol \
  && tar -x --zstd -f /tmp/ollama.tar.zst -C /tmp/ol \
@@ -64,7 +65,7 @@ RUN curl -fsSL -o /tmp/ollama.tar.zst https://github.com/ollama/ollama/releases/
  && cp -a /tmp/ol/lib/ollama /usr/local/lib/ollama \
  && rm -rf /usr/local/lib/ollama/cuda* /tmp/ol /tmp/ollama.tar.zst
 ENV OLLAMA_HOST=127.0.0.1:11434 \
-    OLLAMA_MODELS=/data/ollama/models \
+    OLLAMA_MODELS=/var/lib/ollama/models \
     OLLAMA_MAX_LOADED_MODELS=1 \
     OLLAMA_NUM_PARALLEL=1 \
     OLLAMA_CONTEXT_LENGTH=16384 \
@@ -78,7 +79,7 @@ ENV HOST=0.0.0.0 \
     XDG_DATA_HOME=/data/xdg/data \
     XDG_CONFIG_HOME=/data/xdg/config \
     XDG_CACHE_HOME=/tmp/xdg/cache
-RUN mkdir -p /workspace /data/xdg/data /data/xdg/config /data/ollama/models /tmp/xdg/cache \
+RUN mkdir -p /workspace /data/xdg/data /data/xdg/config /var/lib/ollama/models /tmp/xdg/cache \
  && printf '# Welcome to your OpenCode sandbox\n\nA real Linux box for coding: python3, git, gcc/g++, make and the usual shell tools are installed. Try `python3 -V` in shell mode.\n' > /workspace/README.md
 EXPOSE 8080
 CMD ["/bin/sh", "/app/entrypoint.sh"]
