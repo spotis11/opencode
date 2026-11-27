@@ -19,6 +19,11 @@ else
   echo "[entrypoint] WARNING: ollama did not become ready in 60s; continuing (see /tmp/ollama.log)"
 fi
 
+# One-time cleanup: earlier deploys pulled models into /data (before it turned
+# out to be a small persistent state volume) — those stale blobs only waste
+# the 10 GB state volume now that models live on the main disk.
+rm -rf /data/ollama 2>/dev/null || true
+
 # Pull missing models in the background — the web shell starts right away and
 # /__status reports model readiness. Never pull more than the free space on
 # the models disk allows: a full disk breaks the engine's SQLite writes
