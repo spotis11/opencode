@@ -38,6 +38,28 @@ It
 Everything you get — tabs, sessions, diffs, review, terminal panel, themes, PWA —
 is the desktop app's own UI, unmodified.
 
+## Fork touches
+
+Two small, deliberate deltas from upstream, both in this repo:
+
+- **`(reset)` next to the effort selector** — once a model variant (effort) is
+  active, the composer shows the effort chip next to the model; to its right
+  sits a faint `(reset)` control (the olliecode touch) that restores the
+  model's default effort in one click, no menu needed. Lives in
+  `web-overlay/packages/app/src/composer/editor/editor.tsx`, overlaid onto the
+  pristine v2.4.2 renderer at Docker build time.
+
+  <p align="center">
+    <img src="docs/web-ui-reset.png" alt="OpenCode Web — (reset) next to the effort selector" width="70%">
+  </p>
+
+- **A full Linux sandbox** — the container ships a real coding environment, not
+  a bare image: `python3` (+ `pip`, `venv`), `git`, `gcc`/`g++`/`make`
+  (build-essential), `ripgrep`, `jq`, `sqlite3`, `curl`/`wget`, `unzip`/`zip`,
+  `openssh-client`, `nano`, man pages — on top of Node 24. The agent shells out
+  inside `/workspace` and everything a project needs is already there; the
+  welcome file in `/workspace` says so too.
+
 ## Run locally
 
 ```sh
@@ -64,11 +86,11 @@ The agent operates on `/workspace` (override with `OPENCODE_PROJECT_DIR`).
 ## Deploy to running.sh
 
 The repo deploys as-is (the Dockerfile is detected and built as a container).
-**Size: use `standard-1` or bigger** — the `lite` instance's 256 MiB cannot hold
-the Node proxy plus the Bun-compiled engine at the same time; no matter the
-memory caps, a lite container serves fine for about a minute and a half and
-then gets OOM-killed (SIGKILL 137) in a loop. `standard-1` with
-`alwaysOn: false` sleeps when idle and only costs compute while it is awake.
+**Size: `standard-4`** — that is what this deployment runs (more storage, more
+headroom, faster builds). It also needs more than `lite` would give: the
+lite instance's 256 MiB cannot hold the Node proxy plus the Bun-compiled engine
+at the same time; no matter the memory caps, a lite container serves fine for
+about a minute and a half and then gets OOM-killed (SIGKILL 137) in a loop.
 
 ```sh
 # project + service (public repo, no GitHub App needed)
