@@ -1,152 +1,163 @@
-<h1 align="center">OpenCode Web</h1>
+# OpenCode Web
 
-<p align="center">A <b>web version of the OpenCode desktop app</b>, built from this repository's own source.</p>
+A **web version of the OpenCode desktop app** (v2.4.2), built from its source.
 
-<p align="center">
-  <img src="docs/web-ui-home.png" alt="OpenCode Web — home" width="49%">
-  <img src="docs/web-ui-session.png" alt="OpenCode Web — new session" width="49%">
-</p>
-<p align="center">
-  <img src="docs/web-ui-sent.png" alt="OpenCode Web — live session streaming from the engine" width="98%">
-</p>
-
-## What is this?
-
-The desktop app is an Electron shell around a SolidJS renderer plus the `opencode`
-engine. The renderer is platform-adaptive: without the Electron bridge it runs its
-built-in **web platform** (`packages/app/src/runtime/platform/web.ts`) and talks to
-the engine over same-origin HTTP.
-
-This fork keeps all upstream code untouched and adds a small, dependency-free
-Node.js shell (`server.js` at the repo root) that plays the role the Electron main
-process plays on desktop:
+The desktop app is an Electron shell around a SolidJS renderer and the
+`opencode` engine. This project keeps the exact same pieces and swaps the
+Electron shell for a Node.js one:
 
 ```
 Desktop app  =  Electron main process  +  SolidJS renderer  +  opencode engine
 Web version  =  Node.js server.js      +  the same renderer  +  the same engine
 ```
 
-It
+The renderer is platform-adaptive: when the Electron preload bridge is absent
+it runs its built-in "web" platform (`packages/app/src/runtime/platform/web.ts`)
+and talks to the engine over same-origin HTTP. So the UI you get here — tabs,
+sessions, diffs, review, terminal panel, themes — is the desktop app's own UI.
 
-- builds the official web UI from this repo (`bun install` + `vite build` in `packages/app`),
-- spawns `opencode serve` (the v2 API + web engine) as a sidecar and reads the server password it prints,
-- serves the UI at `/` and reverse-proxies `/api/*` — REST, SSE events, and WebSocket
-  upgrades (PTY terminals) — to the engine, injecting its Basic auth **server-side**
-  so the browser never sees a credential,
-- reports readiness at `/__status`.
+## What is inside
 
-Everything you get — tabs, sessions, diffs, review, terminal panel, themes, PWA —
-is the desktop app's own UI, unmodified.
+| Path           | What it is                                                                    |
+| -------------- | ----------------------------------------------------------------------------- |
+| `server.js`    | The Node.js shell: static hosting, API proxy, engine sidecar (0 dependencies) |
+| `web/`         | The renderer, **built from source** with `vite build` (`packages/app`)        |
+| `engine/opencode` | The `opencode` CLI, extracted from the official Linux `.deb` (v2.4.2)      |
+| `entrypoint.sh`   | Container startup: brings up Ollama (local models) before the web shell    |
+| `docs/`        | Screenshots taken while verifying the app in a real browser                   |
+| `dev/build-from-source.sh` | Rebuilds `web/` from the upstream monorepo source                  |
 
-## Fork touches
+## Run it
 
-Two small, deliberate deltas from upstream, both in this repo:
-
-- **A black `reset` button next to the model / effort selector** — olliecode's
-  usage-reset pill, rebuilt for the web app. It sits in the composer controls
-  row, so it appears on every tab (current ones and new ones). One click zeroes
-  the engine's **local usage accounting**: the cost / token aggregate columns
-  on every session (`session_v2.cost`, `tokens_input`, `tokens_output`,
-  `tokens_reasoning`, `tokens_cache_read`, `tokens_cache_write`) plus the usage
-  event rows in the engine's SQLite database. Conversations are never touched —
-  sessions, messages and parts all stay. A timestamped `.backup` of the
-  database is written to `usage-backups/` before each reset, so it is always
-  reversible. Local-only by design: nothing outside this deployment's own
-  database is touched — no IP rotation, no identity rewriting; provider-side
-  quotas are theirs to enforce. Lives in
-  `web-overlay/packages/app/src/composer/editor/editor.tsx` (the button) and
-  `server.js` (`POST /__reset-usage`).
-
-  <p align="center">
-    <img src="docs/web-ui-reset.png" alt="OpenCode Web — black reset button in the composer" width="70%">
-  </p>
-
-- **A full Linux sandbox** — the container ships a real coding environment, not
-  a bare image: `python3` (+ `pip`, `venv`), `git`, `gcc`/`g++`/`make`
-  (build-essential), `ripgrep`, `jq`, `sqlite3`, `curl`/`wget`, `unzip`/`zip`,
-  `openssh-client`, `nano`, man pages — on top of Node 24. The agent shells out
-  inside `/workspace` and everything a project needs is already there; the
-  welcome file in `/workspace` says so too.
-
-## Run locally
-
-```sh
-node server.js                       # http://localhost:8080
+```bash
+node server.js                     # or: npm start / PORT=8080 node server.js
+# open http://localhost:8080
 ```
 
-Requires Node >= 18, a built UI (`bun install && bun run --cwd packages/app build`,
-copy `packages/app/dist` next to `server.js` as `web/`) and the engine
-(`./engine/opencode`, or any `opencode` on `PATH` via `ENGINE_BIN`).
-Without a `web/` directory, `server.js` serves the engine's embedded web build instead.
+Requirements: Node.js >= 18, Linux x64 (for the bundled engine; swap in your
+own `opencode` binary via `ENGINE_BIN` on any other platform).
 
-## Deploy (Docker)
+First run: the server picks a free port, starts `engine/opencode serve` as a
+sidecar, reads the server password it prints, and proxies `/api/*` to it with
+that password injected **server-side** — the browser never sees a credential.
 
-The root `Dockerfile` does everything — builds the UI from source, downloads the
-engine from the official 2.4.2 package, and runs the server:
+Configuration (environment variables):
 
-```sh
+| Variable               | Default                        | Meaning                                  |
+| ---------------------- | ------------------------------ | ---------------------------------------- |
+| `PORT` / `HOST`        | `8080` / `0.0.0.0`             | Where the web app listens                |
+| `ENGINE_BIN`           | `./engine/opencode`            | Engine binary (falls back to `opencode` on PATH) |
+| `ENGINE_PORT`          | random free port               | Fixed engine port                        |
+| `OPENCODE_PROJECT_DIR` | current directory              | The project the agent works on           |
+| `WEB_DIR`              | `./web`                        | Built renderer directory                 |
+
+Health: `GET /__status` shows whether the engine is up, its port and PID,
+and whether the local model server is ready (with its model list).
+
+## Local models (run inside the box)
+
+The Docker image bundles **Ollama** and three models, baked in at build time
+and served on `127.0.0.1:11434` — real models running on the machine itself,
+with no API key and nothing metered anywhere:
+
+| Model                | Size    | Good for                  |
+| -------------------- | ------- | ------------------------- |
+| `qwen2.5-coder:1.5b` | ~1.0 GB | Fast edits and quick chat |
+| `llama3.2:3b`        | ~2.0 GB | General chat              |
+| `qwen2.5-coder:7b`   | ~4.7 GB | Quality coding (heavier)  |
+
+They appear in the composer's model selector under **Ollama (local)** — pick
+one like any cloud model and the engine talks to localhost. Cost shows as 0:
+every token comes from the container's own CPU, not from any provider quota.
+
+On the running.sh standard-4 instance (12 GB RAM / 20 GB storage / 4 vCPU)
+the 7B model holds comfortably in RAM. Generation is fully CPU-based, so it
+is slower than a hosted API (roughly 5–8 tokens/s on 7B, noticeably faster
+on 1.5B/3B) and the first message after a cold start pays a one-off model
+load of tens of seconds — after which the model stays warm for 10 minutes.
+
+`entrypoint.sh` starts Ollama before the web shell, and `server.js` merges
+the `ollama` provider into the engine config on every engine start, so local
+models survive config restores and fresh `/data` volumes. Outside Docker,
+run `ollama serve` yourself and the same selector works.
+
+## Deploy
+
+### Docker
+
+The `Dockerfile` in this directory builds the UI **from the upstream monorepo
+source** (Bun + Vite) and downloads the engine from the official 2.4.2
+package. It also bakes in the local models above — the build pulls ~8 GB of
+model weights once, so the first build takes noticeably longer than the rest:
+
+```bash
 docker build -t opencode-web .
 docker run -p 8080:8080 -v "$PWD/my-project:/workspace" opencode-web
 ```
 
-The agent operates on `/workspace` (override with `OPENCODE_PROJECT_DIR`).
+Without a bundled `web/` directory (slim builds), `server.js` automatically
+serves the engine's embedded web build instead — the same official UI.
 
-## Deploy to running.sh
+### running.sh
 
-The repo deploys as-is (the Dockerfile is detected and built as a container).
-**Size: `standard-4`** — that is what this deployment runs (more storage, more
-headroom, faster builds). It also needs more than `lite` would give: the
-lite instance's 256 MiB cannot hold the Node proxy plus the Bun-compiled engine
-at the same time; no matter the memory caps, a lite container serves fine for
-about a minute and a half and then gets OOM-killed (SIGKILL 137) in a loop.
+Deployed live at a `*.running.sh` URL as a **standard-4** container (12 GB
+RAM, 20 GB storage, 4 vCPU — sized to also run the local models above; this
+directory's `Dockerfile` is detected from the GitHub repo and built; port
+8080, healthcheck `/__status`, sleeps after 30 min idle and wakes on request,
+so compute is only billed while it is awake).
 
-```sh
-# project + service (public repo, no GitHub App needed)
-curl -X POST -H "Authorization: Bearer $RUNNING_TOKEN" https://running.sh/api/v1/projects \
-  -d '{"workspaceId":"'$WS'","name":"opencode-web"}'
-curl -X POST -H "Authorization: Bearer $RUNNING_TOKEN" \
-  https://running.sh/api/v1/projects/$P/services \
-  -d '{"name":"web","source":{"type":"github","repo":"OWNER/opencode","branch":"dev"}}'
-```
+> Sizing note: the free **lite** instance (256 MiB) cannot hold the Node proxy
+> plus the Bun-compiled engine — containers serve for ~90 s and are then
+> OOM-killed in a loop (SIGKILL 137). Use standard-1 or bigger.
 
-### Keeping state across deploys
+**State across deploys** (`scripts/persist-snapshot.sh save|restore|deploy`):
+a deploy resets the container filesystem, so `server.js` exposes
+`GET /__persist/dump` (stops engine → consistent tar of `/data/xdg` → restarts)
+and `POST /__persist/restore` (extract + engine restart), gated by a
+`PERSIST_TOKEN` secret. Verified end to end: sessions created before a deploy
+are still there after it.
 
-The deployment mounts a persistent disk volume at `/data` (the engine's XDG
-home), so sessions, auth logins and config survive deploys on their own —
-no ritual needed. Two belt-and-braces endpoints remain in `server.js`,
-gated by a `PERSIST_TOKEN` secret (set it as an encrypted service variable):
-
-- `GET /__persist/dump` — stops the engine for a consistent snapshot, tars
-  `/data/xdg`, restarts the engine, streams the archive;
-- `POST /__persist/restore` — extracts an uploaded archive and restarts the
-  engine so the database reloads.
-
-`scripts/persist-snapshot.sh save | restore | deploy` wraps them
-(save → deploy via the API → restore → verify). Verified end to end: a session
-created before a deploy is still there after it.
-
-Configuration (environment variables for `server.js`):
-
-| Variable               | Default             | Meaning                                     |
-| ---------------------- | ------------------- | ------------------------------------------- |
-| `PORT` / `HOST`        | `8080` / `0.0.0.0`  | Where the web app listens                   |
-| `ENGINE_BIN`           | `./engine/opencode` | Engine binary (falls back to `opencode` on PATH) |
-| `ENGINE_PORT`          | random free port    | Fixed engine port                           |
-| `OPENCODE_PROJECT_DIR` | current directory   | The project the agent works on              |
-| `WEB_DIR`              | `./web`             | Built renderer directory                    |
+Deployment was done via the running.sh API (project → service → deployment),
+see `scripts/deploy-running.sh` and `scripts/persist-snapshot.sh`.
 
 ## Using the app
 
-1. Open the app — Home shows projects and recent sessions, like the desktop app.
-2. **New session** — the composer supports `/` commands, `@` context mentions,
-   image attachments and agent selection (Build / Plan / Big Pickle).
-3. The engine is the real OpenCode v2 engine: sign in to a provider
-   (`engine/opencode auth login` or an `opencode.json` in the project directory)
-   and sessions run models. Without a provider the UI works end to end, but the
-   agent has nothing to call.
+1. Open `http://localhost:8080` — Home shows your projects and sessions
+   (exactly like the desktop app's home).
+2. Click **New session**. The composer supports `/` commands, `@` context
+   mentions, image attachments, agent selection (Build / Plan / Big Pickle).
+3. The engine is the real OpenCode v2 engine: sign in to a provider with
+   `./engine/opencode auth login` (or set up `opencode.json` in your project
+   directory) for cloud models — or just pick one of the **Ollama (local)**
+   models in the composer's model selector, which need no sign-in at all and
+   run entirely inside the machine.
 
-## Credits & license
+The project the agent operates on defaults to the directory you started
+`server.js` from (override with `OPENCODE_PROJECT_DIR`). The UI detects its
+git branch, sessions run tool calls against it, and the review panel shows
+diffs — same engine semantics as the desktop app.
 
-All upstream code is [OpenCode](https://github.com/anomalyco/opencode) by
-[Anomaly](https://anomaly.co) — MIT licensed. The additions in this fork
-(`server.js`, `Dockerfile`, docs) are MIT as well.
+## How it was built
+
+1. Downloaded the official Linux desktop app
+   (`opencode-desktop-linux-amd64.deb`, v2.4.2) and unpacked it: the Electron
+   `app.asar` contains the renderer bundle and the engine binary.
+2. Pulled the matching upstream source (`github.com/anomalyco/opencode`,
+   tag `v2.4.2`). The desktop app's UI lives in the `@opencode/app` workspace
+   package, which ships an official **web** entry (`src/entry.tsx`) used for
+   the web/PWA surface.
+3. `bun install` + `vite build` in `packages/app` produced `web/` (2811
+   precached files, PWA service worker included).
+4. Verified `opencode serve` (the engine, also inside the deb): API under
+   `/api/*`, SSE events at `/api/event`, Basic auth
+   `opencode:<password>`, PTY over WebSocket at `/api/pty/:id/connect`.
+5. Wrote `server.js` to play the Electron-main role: sidecar management,
+   static hosting, streaming proxy (REST + SSE + WS upgrades).
+
+## Security notes
+
+- The engine binds to `127.0.0.1` only; the browser reaches it exclusively
+  through this server, and the engine password stays in the server process.
+- The web UI has no built-in authentication. If you expose `HOST` beyond
+  localhost, put it behind your own auth proxy — anyone who can reach the app
+  can drive the agent on `OPENCODE_PROJECT_DIR`.
