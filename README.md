@@ -56,9 +56,11 @@ and whether the local model server is ready (with its model list).
 
 ## Local models (run inside the box)
 
-The Docker image bundles **Ollama** and three models, baked in at build time
-and served on `127.0.0.1:11434` — real models running on the machine itself,
-with no API key and nothing metered anywhere:
+The Docker image bundles **Ollama** and three models, served on
+`127.0.0.1:11434` — real models running on the machine itself, with no API
+key and nothing metered anywhere. The weights are pulled on first boot into
+the persistent `/data` volume (and re-pulled automatically after deploys),
+so the image itself stays small:
 
 | Model                | Size    | Good for                  |
 | -------------------- | ------- | ------------------------- |
@@ -73,13 +75,17 @@ every token comes from the container's own CPU, not from any provider quota.
 On the running.sh standard-4 instance (12 GB RAM / 20 GB storage / 4 vCPU)
 the 7B model holds comfortably in RAM. Generation is fully CPU-based, so it
 is slower than a hosted API (roughly 5–8 tokens/s on 7B, noticeably faster
-on 1.5B/3B) and the first message after a cold start pays a one-off model
-load of tens of seconds — after which the model stays warm for 10 minutes.
+on 1.5B/3B), the very first boot — and the first boot after every deploy —
+downloads the weights (~7.7 GB total, about a minute at datacenter
+bandwidth), and the first message after a cold start pays a one-off model
+load of tens of seconds, after which the model stays warm for 10 minutes.
 
-`entrypoint.sh` starts Ollama before the web shell, and `server.js` merges
-the `ollama` provider into the engine config on every engine start, so local
-models survive config restores and fresh `/data` volumes. Outside Docker,
-run `ollama serve` yourself and the same selector works.
+`entrypoint.sh` starts Ollama before the web shell and pulls any missing
+models in the background (`/__status` reports what is ready), and
+`server.js` merges the `ollama` provider into the engine config on every
+engine start, so local models survive config restores and fresh `/data`
+volumes. Outside Docker, run `ollama serve` yourself and the same selector
+works.
 
 ## Deploy
 
@@ -87,8 +93,10 @@ run `ollama serve` yourself and the same selector works.
 
 The `Dockerfile` in this directory builds the UI **from the upstream monorepo
 source** (Bun + Vite) and downloads the engine from the official 2.4.2
-package. It also bakes in the local models above — the build pulls ~8 GB of
-model weights once, so the first build takes noticeably longer than the rest:
+package. The local models are not baked into the image: `entrypoint.sh`
+pulls them on first boot into `OLLAMA_MODELS` (default `/data/ollama/models`),
+so the build stays small — point `OLLAMA_MODELS` at a volume to keep weights
+across container rebuilds:
 
 ```bash
 docker build -t opencode-web .
