@@ -59,8 +59,10 @@ and whether the local model server is ready (with its model list).
 The Docker image bundles **Ollama** and three models, served on
 `127.0.0.1:11434` — real models running on the machine itself, with no API
 key and nothing metered anywhere. The weights are pulled on first boot into
-the persistent `/data` volume (and re-pulled automatically after deploys),
-so the image itself stays small:
+the container's main disk (`/var/lib/ollama/models`, ~18 GB free; re-pulled
+automatically after deploys), so the image itself stays small and the
+persistent `/data` volume (a 1 GB loop device holding only the engine state)
+is never crowded:
 
 | Model                | Size    | Good for                  |
 | -------------------- | ------- | ------------------------- |
@@ -94,9 +96,10 @@ works.
 The `Dockerfile` in this directory builds the UI **from the upstream monorepo
 source** (Bun + Vite) and downloads the engine from the official 2.4.2
 package. The local models are not baked into the image: `entrypoint.sh`
-pulls them on first boot into `OLLAMA_MODELS` (default `/data/ollama/models`),
-so the build stays small — point `OLLAMA_MODELS` at a volume to keep weights
-across container rebuilds:
+pulls them on first boot into `OLLAMA_MODELS` (default
+`/var/lib/ollama/models` on the container's main disk), so the build stays
+small — point `OLLAMA_MODELS` at a volume to keep weights across container
+rebuilds:
 
 ```bash
 docker build -t opencode-web .
