@@ -339,7 +339,22 @@ async function persistDump(res) {
 }
 
 async function persistRestore(req, res) {
+  const wasRunning = Boolean(engine.child && engine.child.exitCode === null)
   try {
+    // Stop the engine BEFORE extracting. The running engine holds its SQLite
+    // WAL open; extracting the archive under it and only then restarting let
+    // the stale WAL checkpoint right back over the restored database — the
+    // restore "succeeded" and then silently reverted. Stopped engines
+    // checkpoint and drop their WAL on exit, so the extracted database is the
+    // only copy left on disk.
+    if (wasRunning) {
+      log("restore: stopping engine before extraction")
+      stopEngine()
+      await new Promise((ok) => {
+        const w = () => (!engine.child || engine.child.exitCode !== null ? ok() : setTimeout(w, 200))
+        w()
+      })
+    }
     const tmp = path.join(os.tmpdir(), "persist-restore.tgz")
     const ws = fs.createWriteStream(tmp)
     await new Promise((ok, err) => {
@@ -364,11 +379,12 @@ async function persistRestore(req, res) {
     }
     fs.unlink(tmp, () => {})
     log(`restored engine state (${size} bytes) — restarting engine`)
-    await restartEngine()
+    if (wasRunning) await restartEngine()
     res.writeHead(200, { "content-type": "application/json" })
-    res.end(JSON.stringify({ restored: size, engineRestarted: true }))
+    res.end(JSON.stringify({ restored: size, engineRestarted: wasRunning }))
   } catch (err) {
     log(`restore failed: ${err.message}`)
+    if (wasRunning && (!engine.child || engine.child.exitCode !== null)) startEngine()
     res.writeHead(500, { "content-type": "application/json" })
     res.end(JSON.stringify({ error: err.message }))
   }
