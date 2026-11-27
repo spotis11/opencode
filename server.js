@@ -147,6 +147,7 @@ function engineBase() {
 
 function startEngine() {
   fs.mkdirSync(LOG_DIR, { recursive: true })
+  ensureLocalProvider()
   const logFile = fs.openSync(path.join(LOG_DIR, "engine.log"), "a")
 
   return freePort().then((port) => {
@@ -391,89 +392,59 @@ async function persistRestore(req, res) {
 }
 
 // ---------------------------------------------------------------------------
-// Usage reset (olliecode's reset pill, web version)
+// Local models (Ollama running inside this container)
 //
-// Zeroes the engine's local usage accounting — the cost/token aggregate
-// columns on every session_v2 row and the usage-related event rows — while
-// keeping every conversation (sessions, messages and parts are untouched).
-// The engine keeps running: SQLite in WAL mode takes the short write with a
-// busy timeout, and the UI reloads after the reset to re-read the zeroed
-// counters. A timestamped .backup of the database is taken first, so a reset
-// is always reversible. Local-only by design: nothing outside this
-// deployment's own database is touched.
+// The engine gets an "ollama" provider pointed at the in-container model
+// server (127.0.0.1:11434), so the model selector offers real local models:
+// no API keys, no provider-side metering — everything runs on this box's own
+// CPU/RAM. The provider entry is merged into the engine config on every
+// engine start (boot, restart, post-restore), so a config restore or a fresh
+// /data can never drop it. Anything else already in the config file is kept.
 // ---------------------------------------------------------------------------
 
-const ENGINE_DB = path.join(DATA_DIR, "xdg", "data", "opencode", "opencode.db")
+const ENGINE_CONFIG_DIR = path.join(DATA_DIR, "xdg", "config", "opencode")
 
-function sqlite(db, script) {
-  return new Promise((ok, err) => {
-    const proc = spawn("sqlite3", ["-cmd", "PRAGMA busy_timeout=10000", db], {
-      stdio: ["pipe", "pipe", "pipe"],
-    })
-    let out = ""
-    let msg = ""
-    proc.stdout.on("data", (c) => (out += c))
-    proc.stderr.on("data", (c) => (msg += c))
-    proc.on("error", err)
-    proc.on("exit", (code) => (code === 0 ? ok(out) : err(new Error(`sqlite3 exit ${code}: ${msg.slice(0, 300)}`))))
-    proc.stdin.end(script)
-  })
+const LOCAL_PROVIDER = {
+  npm: "@ai-sdk/openai-compatible",
+  name: "Ollama (local)",
+  options: { baseURL: "http://127.0.0.1:11434/v1" },
+  models: {
+    "qwen2.5-coder:1.5b": {
+      name: "Qwen2.5 Coder 1.5B",
+      tool_call: true,
+      cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+      limit: { context: 16384, output: 8192 },
+    },
+    "llama3.2:3b": {
+      name: "Llama 3.2 3B",
+      tool_call: true,
+      cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+      limit: { context: 16384, output: 8192 },
+    },
+    "qwen2.5-coder:7b": {
+      name: "Qwen2.5 Coder 7B",
+      tool_call: true,
+      cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+      limit: { context: 16384, output: 8192 },
+    },
+  },
 }
 
-async function resetUsage(res) {
+function ensureLocalProvider() {
+  const cfgFile = path.join(ENGINE_CONFIG_DIR, "opencode.json")
+  let cfg = {}
   try {
-    if (!fs.existsSync(ENGINE_DB)) throw new Error(`engine database not found at ${ENGINE_DB}`)
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-")
-    const backupDir = path.join(path.dirname(ENGINE_DB), "usage-backups")
-    fs.mkdirSync(backupDir, { recursive: true })
-    const backup = path.join(backupDir, `usage-reset-${stamp}.db`)
-    await sqlite(ENGINE_DB, `.backup '${backup}'`)
-    const out = await sqlite(
-      ENGINE_DB,
-      `UPDATE session_v2
-          SET cost = 0,
-              tokens_input = 0,
-              tokens_output = 0,
-              tokens_reasoning = 0,
-              tokens_cache_read = 0,
-              tokens_cache_write = 0;
-       SELECT 'sessions=' || changes();
-       -- The session header's context badge (e.g. "5k") is computed from the
-       -- per-message token metadata inside session_message.data, not from the
-       -- session aggregates — zero those too. The message text itself lives in
-       -- session_part, which this does not touch.
-       UPDATE session_message
-          SET data = json_set(data,
-            '$.tokens.input', 0,
-            '$.tokens.output', 0,
-            '$.tokens.reasoning', 0,
-            '$.tokens.cache.read', 0,
-            '$.tokens.cache.write', 0)
-        WHERE json_extract(data, '$.tokens') IS NOT NULL;
-       SELECT 'messages=' || changes();
-       UPDATE session_message
-          SET data = json_set(data, '$.cost', 0)
-        WHERE json_extract(data, '$.cost') IS NOT NULL;
-       DELETE FROM event
-         WHERE type LIKE 'session.usage.recorded@%'
-            OR type LIKE 'session.step.ended@%'
-            OR type LIKE 'session.step.failed@%';
-       SELECT 'events=' || changes();`,
-    )
-    const sessions = Number((out.match(/sessions=(\d+)/) || [])[1] || 0)
-    const messages = Number((out.match(/messages=(\d+)/) || [])[1] || 0)
-    const events = Number((out.match(/events=(\d+)/) || [])[1] || 0)
-    log(
-      `usage reset: ${sessions} sessions zeroed, ${messages} messages' token metadata zeroed, ` +
-        `${events} usage events purged (backup ${path.basename(backup)})`,
-    )
-    res.writeHead(200, { "content-type": "application/json" })
-    res.end(JSON.stringify({ ok: true, sessions, messages, events, backup: path.basename(backup) }))
-  } catch (err) {
-    log(`usage reset failed: ${err.message}`)
-    res.writeHead(500, { "content-type": "application/json" })
-    res.end(JSON.stringify({ ok: false, error: err.message }))
+    cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"))
+    if (!cfg || typeof cfg !== "object") cfg = {}
+  } catch {
+    cfg = {} // fresh box or no config yet — create one
   }
+  cfg.provider = cfg.provider && typeof cfg.provider === "object" ? cfg.provider : {}
+  if (JSON.stringify(cfg.provider.ollama) === JSON.stringify(LOCAL_PROVIDER)) return
+  cfg.provider.ollama = LOCAL_PROVIDER
+  fs.mkdirSync(ENGINE_CONFIG_DIR, { recursive: true })
+  fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 2))
+  log("local model provider (ollama @ 127.0.0.1:11434) ensured in engine config")
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +573,22 @@ function serveStatic(req, res) {
 // Status endpoint
 // ---------------------------------------------------------------------------
 
-function serveStatus(res) {
+async function serveStatus(res) {
+  // Local model server (Ollama) liveness, so /__status shows the whole stack.
+  let local = { ready: false, models: [] }
+  try {
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), 800)
+    const r = await fetch("http://127.0.0.1:11434/api/tags", { signal: ctl.signal })
+    clearTimeout(timer)
+    if (r.ok) {
+      const tags = await r.json()
+      local.ready = true
+      local.models = (tags.models || []).map((m) => m.name)
+    }
+  } catch {
+    // ollama not up yet — reported as ready: false
+  }
   res.writeHead(200, { "content-type": "application/json; charset=utf-8" })
   res.end(
     JSON.stringify(
@@ -618,6 +604,7 @@ function serveStatus(res) {
           hasPassword: Boolean(engine.password),
           lastError: engine.lastError || undefined,
         },
+        localModels: local,
         webDir: path.basename(WEB_DIR),
         projectDir: PROJECT_DIR,
         persist: Boolean(PERSIST_TOKEN),
@@ -664,7 +651,6 @@ const server = http.createServer((req, res) => {
     return persistRestore(req, res)
   }
   if (req.url.startsWith("/__status")) return serveStatus(res)
-  if (req.url === "/__reset-usage" && req.method === "POST") return resetUsage(res)
   if (req.url === "/api" || req.url.startsWith("/api/")) {
     if (!engine.ready) {
       res.writeHead(503, { "content-type": "application/json" })
