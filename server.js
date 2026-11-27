@@ -438,6 +438,22 @@ async function resetUsage(res) {
               tokens_cache_read = 0,
               tokens_cache_write = 0;
        SELECT 'sessions=' || changes();
+       -- The session header's context badge (e.g. "5k") is computed from the
+       -- per-message token metadata inside session_message.data, not from the
+       -- session aggregates — zero those too. The message text itself lives in
+       -- session_part, which this does not touch.
+       UPDATE session_message
+          SET data = json_set(data,
+            '$.tokens.input', 0,
+            '$.tokens.output', 0,
+            '$.tokens.reasoning', 0,
+            '$.tokens.cache.read', 0,
+            '$.tokens.cache.write', 0)
+        WHERE json_extract(data, '$.tokens') IS NOT NULL;
+       SELECT 'messages=' || changes();
+       UPDATE session_message
+          SET data = json_set(data, '$.cost', 0)
+        WHERE json_extract(data, '$.cost') IS NOT NULL;
        DELETE FROM event
          WHERE type LIKE 'session.usage.recorded@%'
             OR type LIKE 'session.step.ended@%'
@@ -445,10 +461,14 @@ async function resetUsage(res) {
        SELECT 'events=' || changes();`,
     )
     const sessions = Number((out.match(/sessions=(\d+)/) || [])[1] || 0)
+    const messages = Number((out.match(/messages=(\d+)/) || [])[1] || 0)
     const events = Number((out.match(/events=(\d+)/) || [])[1] || 0)
-    log(`usage reset: ${sessions} sessions zeroed, ${events} usage events purged (backup ${path.basename(backup)})`)
+    log(
+      `usage reset: ${sessions} sessions zeroed, ${messages} messages' token metadata zeroed, ` +
+        `${events} usage events purged (backup ${path.basename(backup)})`,
+    )
     res.writeHead(200, { "content-type": "application/json" })
-    res.end(JSON.stringify({ ok: true, sessions, events, backup: path.basename(backup) }))
+    res.end(JSON.stringify({ ok: true, sessions, messages, events, backup: path.basename(backup) }))
   } catch (err) {
     log(`usage reset failed: ${err.message}`)
     res.writeHead(500, { "content-type": "application/json" })
