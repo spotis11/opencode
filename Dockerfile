@@ -20,11 +20,7 @@ WORKDIR /src
 # The bun image has no curl/wget — ADD fetches the tarball itself.
 ADD https://github.com/anomalyco/opencode/archive/refs/tags/v2.4.2.tar.gz /tmp/src.tgz
 RUN tar -xzf /tmp/src.tgz --strip-components=1
-# Web-specific overlays on top of the pristine v2.4.2 renderer:
-#   - composer editor: "(reset)" control next to the effort/variant selector
-#   - en locale: ui.promptInput.resetVariant string
-COPY web-overlay/packages/ui/src/i18n/en.ts packages/ui/src/i18n/en.ts
-COPY web-overlay/packages/app/src/composer/editor/editor.tsx packages/app/src/composer/editor/editor.tsx
+# The renderer is the pristine v2.4.2 source — no local overlays.
 RUN bun install --frozen-lockfile
 RUN cd packages/app && bun run build
 
@@ -36,7 +32,7 @@ WORKDIR /app
 # OPENCODE_PROJECT_DIR, and everything installed here is available to it.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl wget binutils xz-utils unzip zip file \
+      ca-certificates curl wget binutils xz-utils zstd unzip zip file \
       git openssh-client \
       python3 python3-pip python3-venv \
       build-essential pkg-config \
@@ -55,8 +51,39 @@ RUN curl -fsSL -o /tmp/opencode.deb https://opencode.ai/files/bin/2.4.2/opencode
  && for f in /tmp/data.tar.*; do tar -xf "$f" -C /tmp/oc; done \
  && install -m 0755 "$(find /tmp/oc -type f -name opencode-cli | head -1)" /app/engine/opencode \
  && rm -rf /tmp/oc /tmp/opencode.deb /tmp/data.tar.* /tmp/control.tar.* /tmp/debian-binary
+# Local models: Ollama runs inside this container (CPU-only — the GPU backend
+# libraries are stripped to keep the image small). Three models are baked in
+# at build time, so every deploy ships them, nothing is downloaded at runtime,
+# and no provider meters any usage — it is all this box's own compute:
+#   qwen2.5-coder:1.5b  (~1.0 GB)  fast edits and chat
+#   llama3.2:3b         (~2.0 GB)  general chat
+#   qwen2.5-coder:7b    (~4.7 GB)  quality coding — fits the 12 GB RAM budget
+RUN curl -fsSL -o /tmp/ollama.tar.zst https://github.com/ollama/ollama/releases/download/v0.40.18/ollama-linux-amd64.tar.zst \
+ && mkdir -p /tmp/ol \
+ && tar -x --zstd -f /tmp/ollama.tar.zst -C /tmp/ol \
+ && install -m 0755 /tmp/ol/bin/ollama /usr/local/bin/ollama \
+ && mkdir -p /usr/local/lib \
+ && cp -a /tmp/ol/lib/ollama /usr/local/lib/ollama \
+ && rm -rf /usr/local/lib/ollama/cuda* /tmp/ol /tmp/ollama.tar.zst
+ENV OLLAMA_HOST=127.0.0.1:11434 \
+    OLLAMA_MODELS=/opt/ollama/models \
+    OLLAMA_MAX_LOADED_MODELS=1 \
+    OLLAMA_NUM_PARALLEL=1 \
+    OLLAMA_CONTEXT_LENGTH=16384 \
+    OLLAMA_KEEP_ALIVE=10m
+# Pull the models now (baked into the image) — one ollama serve for the pulls.
+RUN set -eux; \
+    mkdir -p /opt/ollama/models; \
+    ollama serve >/tmp/ollama-build.log 2>&1 & \
+    pid=$!; \
+    for i in $(seq 1 60); do curl -sf http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 1; done; \
+    ollama pull qwen2.5-coder:1.5b; \
+    ollama pull llama3.2:3b; \
+    ollama pull qwen2.5-coder:7b; \
+    kill $pid
 COPY --from=build /src/packages/app/dist /app/web
 COPY server.js /app/server.js
+COPY entrypoint.sh /app/entrypoint.sh
 ENV HOST=0.0.0.0 \
     PORT=8080 \
     OPENCODE_PROJECT_DIR=/workspace \
@@ -66,4 +93,4 @@ ENV HOST=0.0.0.0 \
 RUN mkdir -p /workspace /data/xdg/data /data/xdg/config /tmp/xdg/cache \
  && printf '# Welcome to your OpenCode sandbox\n\nA real Linux box for coding: python3, git, gcc/g++, make and the usual shell tools are installed. Try `python3 -V` in shell mode.\n' > /workspace/README.md
 EXPOSE 8080
-CMD ["node", "/app/server.js"]
+CMD ["/bin/sh", "/app/entrypoint.sh"]
