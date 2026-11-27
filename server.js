@@ -247,6 +247,18 @@ function startEngine() {
     child.on("exit", (code, signal) => {
       log(`engine exited (code=${code} signal=${signal})`)
       engine.ready = false
+      // Self-heal: an unexpected exit (a crash — no SIGTERM/SIGINT signal) is
+      // restarted after a short delay so a transient failure never leaves the
+      // app dead. Intentional stops (persist dump/restore, SIGTERM) are not
+      // restarted here — their callers own the lifecycle.
+      if (!signal) {
+        setTimeout(() => {
+          if (!engine.child || engine.child.exitCode !== null) {
+            log("restarting engine after unexpected exit")
+            startEngine()
+          }
+        }, 3000)
+      }
       // Do not flap forever; a supervisor (or a restart of this server) starts it again.
     })
     return child
@@ -313,9 +325,17 @@ async function persistDump(res) {
     try {
       const tmp = path.join(os.tmpdir(), "persist-dump.tgz")
       await new Promise((ok, err) => {
-        const tar = spawn("tar", ["czf", tmp, "-C", PERSIST_DIR, "xdg"], {
-          stdio: ["ignore", "ignore", "pipe"],
-        })
+        const tar = spawn(
+          "tar",
+          [
+            "czf", tmp,
+            // usage-backups are dead weight from the retired reset endpoint —
+            // they ballooned the payload past the ingress body limit once.
+            "--exclude=xdg/data/opencode/usage-backups",
+            "-C", PERSIST_DIR, "xdg",
+          ],
+          { stdio: ["ignore", "ignore", "pipe"] },
+        )
         let msg = ""
         tar.stderr.on("data", (c) => (msg += c))
         tar.on("exit", (code) => (code === 0 ? ok() : err(new Error(`tar exit ${code}: ${msg.slice(0, 200)}`))))
@@ -462,6 +482,21 @@ const HOP_BY_HOP = new Set([
   "upgrade",
 ])
 
+// Tail of a small log file for /__status (container debugging without a shell).
+function logTail(file, bytes = 2000) {
+  try {
+    const st = fs.statSync(file)
+    const fd = fs.openSync(file, "r")
+    const start = Math.max(0, st.size - bytes)
+    const buf = Buffer.alloc(st.size - start)
+    fs.readSync(fd, buf, 0, buf.length, start)
+    fs.closeSync(fd)
+    return buf.toString("utf8").slice(-bytes)
+  } catch {
+    return undefined
+  }
+}
+
 function proxyApi(req, res) {
   const target = new URL(req.url, engineBase())
   const headers = {}
@@ -605,6 +640,9 @@ async function serveStatus(res) {
           lastError: engine.lastError || undefined,
         },
         localModels: local,
+        engineLogTail: logTail(path.join(LOG_DIR, "engine.log")),
+        pullLogTail: logTail("/tmp/ollama-pull.log"),
+        ollamaLogTail: logTail("/tmp/ollama.log", 800),
         webDir: path.basename(WEB_DIR),
         projectDir: PROJECT_DIR,
         persist: Boolean(PERSIST_TOKEN),
