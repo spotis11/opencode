@@ -203,6 +203,20 @@ function startEngine() {
         cycles++
         const up = await pollReady(`${engineBase()}/`, 15000, 500)
         if (up) {
+          if (!sawPassword && restarts < 2) {
+            // A boot that never printed a server password would 401 every API
+            // call — useless. Restart the engine once and expect the line.
+            restarts++
+            log("engine ready but no server password was printed — restarting it once")
+            stopEngine()
+            await new Promise((ok) => {
+              const w = () =>
+                !engine.child || engine.child.exitCode !== null ? ok() : setTimeout(w, 200)
+              w()
+            })
+            if (engine.child === child) startEngine()
+            return // the new child runs its own markReady loop
+          }
           engine.ready = true
           log(`engine ready at ${engineBase()} (password ${sawPassword ? "captured" : "not required"})`)
           return
@@ -357,6 +371,72 @@ async function persistRestore(req, res) {
     log(`restore failed: ${err.message}`)
     res.writeHead(500, { "content-type": "application/json" })
     res.end(JSON.stringify({ error: err.message }))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Usage reset (olliecode's reset pill, web version)
+//
+// Zeroes the engine's local usage accounting — the cost/token aggregate
+// columns on every session_v2 row and the usage-related event rows — while
+// keeping every conversation (sessions, messages and parts are untouched).
+// The engine keeps running: SQLite in WAL mode takes the short write with a
+// busy timeout, and the UI reloads after the reset to re-read the zeroed
+// counters. A timestamped .backup of the database is taken first, so a reset
+// is always reversible. Local-only by design: nothing outside this
+// deployment's own database is touched.
+// ---------------------------------------------------------------------------
+
+const ENGINE_DB = path.join(DATA_DIR, "xdg", "data", "opencode", "opencode.db")
+
+function sqlite(db, script) {
+  return new Promise((ok, err) => {
+    const proc = spawn("sqlite3", ["-cmd", "PRAGMA busy_timeout=10000", db], {
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    let out = ""
+    let msg = ""
+    proc.stdout.on("data", (c) => (out += c))
+    proc.stderr.on("data", (c) => (msg += c))
+    proc.on("error", err)
+    proc.on("exit", (code) => (code === 0 ? ok(out) : err(new Error(`sqlite3 exit ${code}: ${msg.slice(0, 300)}`))))
+    proc.stdin.end(script)
+  })
+}
+
+async function resetUsage(res) {
+  try {
+    if (!fs.existsSync(ENGINE_DB)) throw new Error(`engine database not found at ${ENGINE_DB}`)
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-")
+    const backupDir = path.join(path.dirname(ENGINE_DB), "usage-backups")
+    fs.mkdirSync(backupDir, { recursive: true })
+    const backup = path.join(backupDir, `usage-reset-${stamp}.db`)
+    await sqlite(ENGINE_DB, `.backup '${backup}'`)
+    const out = await sqlite(
+      ENGINE_DB,
+      `UPDATE session_v2
+          SET cost = 0,
+              tokens_input = 0,
+              tokens_output = 0,
+              tokens_reasoning = 0,
+              tokens_cache_read = 0,
+              tokens_cache_write = 0;
+       SELECT 'sessions=' || changes();
+       DELETE FROM event
+         WHERE type LIKE 'session.usage.recorded@%'
+            OR type LIKE 'session.step.ended@%'
+            OR type LIKE 'session.step.failed@%';
+       SELECT 'events=' || changes();`,
+    )
+    const sessions = Number((out.match(/sessions=(\d+)/) || [])[1] || 0)
+    const events = Number((out.match(/events=(\d+)/) || [])[1] || 0)
+    log(`usage reset: ${sessions} sessions zeroed, ${events} usage events purged (backup ${path.basename(backup)})`)
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ ok: true, sessions, events, backup: path.basename(backup) }))
+  } catch (err) {
+    log(`usage reset failed: ${err.message}`)
+    res.writeHead(500, { "content-type": "application/json" })
+    res.end(JSON.stringify({ ok: false, error: err.message }))
   }
 }
 
@@ -548,6 +628,7 @@ const server = http.createServer((req, res) => {
     return persistRestore(req, res)
   }
   if (req.url.startsWith("/__status")) return serveStatus(res)
+  if (req.url === "/__reset-usage" && req.method === "POST") return resetUsage(res)
   if (req.url === "/api" || req.url.startsWith("/api/")) {
     if (!engine.ready) {
       res.writeHead(503, { "content-type": "application/json" })
