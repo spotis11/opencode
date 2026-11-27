@@ -210,11 +210,7 @@ function startEngine() {
             restarts++
             log("engine ready but no server password was printed — restarting it once")
             stopEngine()
-            await new Promise((ok) => {
-              const w = () =>
-                !engine.child || engine.child.exitCode !== null ? ok() : setTimeout(w, 200)
-              w()
-            })
+            await engineStopped()
             if (engine.child === child) startEngine()
             return // the new child runs its own markReady loop
           }
@@ -227,11 +223,7 @@ function startEngine() {
           restarts++
           log("engine not ready after 45s — restarting it once")
           stopEngine()
-          await new Promise((ok) => {
-            const w = () =>
-              !engine.child || engine.child.exitCode !== null ? ok() : setTimeout(w, 200)
-            w()
-          })
+          await engineStopped()
           if (engine.child === child) startEngine()
           return // the new child runs its own markReady loop
         }
@@ -272,6 +264,20 @@ function stopEngine() {
   }
 }
 
+// Wait until the current engine child is really gone; SIGKILL after 10s so a
+// wedged process can never hang a persist dump/restore (or a restart) forever.
+async function engineStopped() {
+  const deadline = Date.now() + 10_000
+  while (engine.child && engine.child.exitCode === null && Date.now() < deadline) {
+    await new Promise((ok) => setTimeout(ok, 200))
+  }
+  if (engine.child && engine.child.exitCode === null) {
+    log("engine did not exit in 10s — SIGKILL")
+    engine.child.kill("SIGKILL")
+    await new Promise((ok) => setTimeout(ok, 500))
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Engine-state persistence (deploy-time snapshot / restore)
 //
@@ -292,17 +298,7 @@ function persistAllowed(req) {
 
 function restartEngine() {
   stopEngine()
-  return new Promise((resolve) => {
-    const wait = () => {
-      if (!engine.child || engine.child.exitCode !== null) {
-        startEngine()
-        resolve()
-      } else {
-        setTimeout(wait, 250)
-      }
-    }
-    wait()
-  })
+  return engineStopped().then(() => startEngine())
 }
 
 async function persistDump(res) {
@@ -316,11 +312,7 @@ async function persistDump(res) {
     if (wasRunning) {
       log("dump: stopping engine for a consistent snapshot")
       stopEngine()
-      await new Promise((ok) => {
-        const w = () =>
-          !engine.child || engine.child.exitCode !== null ? ok() : setTimeout(w, 200)
-        w()
-      })
+      await engineStopped()
     }
     try {
       const tmp = path.join(os.tmpdir(), "persist-dump.tgz")
@@ -371,10 +363,7 @@ async function persistRestore(req, res) {
     if (wasRunning) {
       log("restore: stopping engine before extraction")
       stopEngine()
-      await new Promise((ok) => {
-        const w = () => (!engine.child || engine.child.exitCode !== null ? ok() : setTimeout(w, 200))
-        w()
-      })
+      await engineStopped()
     }
     const tmp = path.join(os.tmpdir(), "persist-restore.tgz")
     const ws = fs.createWriteStream(tmp)
@@ -495,6 +484,16 @@ function logTail(file, bytes = 2000) {
   } catch {
     return undefined
   }
+}
+
+function dfStatus() {
+  return new Promise((ok) => {
+    const proc = spawn("df", ["-h", "/data", "/tmp", "/"], { stdio: ["ignore", "pipe", "ignore"] })
+    let out = ""
+    proc.stdout.on("data", (c) => (out += c))
+    proc.on("error", () => ok(undefined))
+    proc.on("exit", (code) => ok(code === 0 ? out.trim() : undefined))
+  })
 }
 
 function proxyApi(req, res) {
@@ -624,6 +623,7 @@ async function serveStatus(res) {
   } catch {
     // ollama not up yet — reported as ready: false
   }
+  const disk = await dfStatus()
   res.writeHead(200, { "content-type": "application/json; charset=utf-8" })
   res.end(
     JSON.stringify(
@@ -640,6 +640,7 @@ async function serveStatus(res) {
           lastError: engine.lastError || undefined,
         },
         localModels: local,
+        disk,
         engineLogTail: logTail(path.join(LOG_DIR, "engine.log")),
         pullLogTail: logTail("/tmp/ollama-pull.log"),
         ollamaLogTail: logTail("/tmp/ollama.log", 800),
