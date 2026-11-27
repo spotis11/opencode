@@ -1,9 +1,10 @@
 #!/bin/sh
 # OpenCode Web container entrypoint: start the local model server (Ollama on
-# 127.0.0.1:11434), make sure the local models exist (pulled into /data on
-# first boot; a deploy resets the container filesystem, so the first boot
-# after each deploy re-pulls them), then hand off to the web shell
-# (server.js), which brings up the engine sidecar.
+# 127.0.0.1:11434), make sure the local models exist (pulled into
+# /var/lib/ollama/models — the container's main disk, ~18 GB free; a deploy
+# resets the container filesystem, so the first boot after each deploy
+# re-pulls them), then hand off to the web shell (server.js), which brings up
+# the engine sidecar.
 set -e
 
 ollama serve >/tmp/ollama.log 2>&1 &
@@ -20,8 +21,8 @@ fi
 
 # Pull missing models in the background — the web shell starts right away and
 # /__status reports model readiness. Never pull more than the free space on
-# /data allows: a full disk breaks the engine's SQLite writes (SIGBUS), so
-# keeping ~1 GB of headroom matters more than having every model.
+# the models disk allows: a full disk breaks the engine's SQLite writes
+# (SIGBUS), so keeping ~1 GB of headroom matters more than having every model.
 #   tag:approx-size-in-KB
 MODELS="qwen2.5-coder:1.5b:1050000 llama3.2:3b:2100000 qwen2.5-coder:7b:4900000"
 
@@ -34,9 +35,9 @@ MODELS="qwen2.5-coder:1.5b:1050000 llama3.2:3b:2100000 qwen2.5-coder:7b:4900000"
     case " $have " in
       *" $m "*) continue ;;
     esac
-    free_kb="$(df -Pk /data 2>/dev/null | awk 'NR==2 {print $4}')"
+    free_kb="$(df -Pk /var/lib/ollama 2>/dev/null | awk 'NR==2 {print $4}')"
     if [ "${free_kb:-0}" -lt "$((need_kb + 1048576))" ]; then
-      echo "[entrypoint] skip $m — only ${free_kb}KB free on /data (need ~${need_kb}KB + headroom)"
+      echo "[entrypoint] skip $m — only ${free_kb}KB free on the models disk (need ~${need_kb}KB + headroom)"
       continue
     fi
     if ollama pull "$m" >"/tmp/ollama-pull.log" 2>&1; then
