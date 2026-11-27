@@ -145,9 +145,9 @@ function engineBase() {
   return `http://127.0.0.1:${engine.port}`
 }
 
-function startEngine() {
+async function startEngine() {
   fs.mkdirSync(LOG_DIR, { recursive: true })
-  ensureLocalProvider()
+  await ensureLocalProvider()
   const logFile = fs.openSync(path.join(LOG_DIR, "engine.log"), "a")
 
   return freePort().then((port) => {
@@ -413,33 +413,67 @@ async function persistRestore(req, res) {
 
 const ENGINE_CONFIG_DIR = path.join(DATA_DIR, "xdg", "config", "opencode")
 
-const LOCAL_PROVIDER = {
-  npm: "@ai-sdk/openai-compatible",
-  name: "Ollama (local)",
-  options: { baseURL: "http://127.0.0.1:11434/v1" },
-  models: {
-    "qwen2.5-coder:1.5b": {
-      name: "Qwen2.5 Coder 1.5B",
-      tool_call: true,
-      cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
-      limit: { context: 16384, output: 8192 },
-    },
-    "llama3.2:3b": {
-      name: "Llama 3.2 3B",
-      tool_call: true,
-      cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
-      limit: { context: 16384, output: 8192 },
-    },
-    "qwen2.5-coder:7b": {
-      name: "Qwen2.5 Coder 7B",
-      tool_call: true,
-      cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
-      limit: { context: 16384, output: 8192 },
-    },
-  },
+// Preferred tags (entrypoint.sh pulls these); whatever else exists in Ollama
+// (e.g. ":latest" variants pulled from a shell) is registered too, so the
+// model selector always reflects models that can actually answer.
+const PREFERRED_LOCAL_MODELS = ["qwen2.5-coder:1.5b", "llama3.2:3b", "qwen2.5-coder:7b"]
+
+const LOCAL_MODEL_NAMES = {
+  "qwen2.5-coder:1.5b": "Qwen2.5 Coder 1.5B",
+  "qwen2.5-coder:7b": "Qwen2.5 Coder 7B",
+  "qwen2.5-coder:latest": "Qwen2.5 Coder 7B",
+  "llama3.2:3b": "Llama 3.2 3B",
+  "llama3.2:latest": "Llama 3.2 3B",
 }
 
-function ensureLocalProvider() {
+// Merge actual Ollama tags with the preferred list (preferred first), then
+// drop a ":latest" variant only when a sibling tag of the same model really
+// exists in Ollama — every remaining id must be answerable.
+function localModelIds(actualNames) {
+  const actual = actualNames.filter(Boolean)
+  const merged = []
+  for (const p of PREFERRED_LOCAL_MODELS) if (actual.includes(p)) merged.push(p)
+  for (const a of actual) if (!merged.includes(a)) merged.push(a)
+  for (const p of PREFERRED_LOCAL_MODELS) if (!merged.includes(p)) merged.push(p)
+  return merged.filter((id) => {
+    if (!id.endsWith(":latest")) return true
+    const base = id.slice(0, -":latest".length)
+    return !actual.some((x) => x.startsWith(base + ":") && x !== id)
+  })
+}
+
+function localModelEntry(id) {
+  return {
+    name: LOCAL_MODEL_NAMES[id] || id,
+    tool_call: true,
+    cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+    limit: { context: 16384, output: 8192 },
+  }
+}
+
+async function localOllamaTags() {
+  try {
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), 800)
+    const r = await fetch("http://127.0.0.1:11434/api/tags", { signal: ctl.signal })
+    clearTimeout(timer)
+    if (r.ok) return ((await r.json()).models || []).map((m) => m.name)
+  } catch {
+    // ollama not up yet
+  }
+  return []
+}
+
+async function ensureLocalProvider() {
+  const ids = localModelIds(await localOllamaTags())
+  const models = {}
+  for (const id of ids) models[id] = localModelEntry(id)
+  const provider = {
+    npm: "@ai-sdk/openai-compatible",
+    name: "Ollama (local)",
+    options: { baseURL: "http://127.0.0.1:11434/v1" },
+    models,
+  }
   const cfgFile = path.join(ENGINE_CONFIG_DIR, "opencode.json")
   let cfg = {}
   try {
@@ -449,11 +483,11 @@ function ensureLocalProvider() {
     cfg = {} // fresh box or no config yet — create one
   }
   cfg.provider = cfg.provider && typeof cfg.provider === "object" ? cfg.provider : {}
-  if (JSON.stringify(cfg.provider.ollama) === JSON.stringify(LOCAL_PROVIDER)) return
-  cfg.provider.ollama = LOCAL_PROVIDER
+  if (JSON.stringify(cfg.provider.ollama) === JSON.stringify(provider)) return
+  cfg.provider.ollama = provider
   fs.mkdirSync(ENGINE_CONFIG_DIR, { recursive: true })
   fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 2))
-  log("local model provider (ollama @ 127.0.0.1:11434) ensured in engine config")
+  log(`local model provider (ollama @ 127.0.0.1:11434) ensured with models: ${ids.join(", ")}`)
 }
 
 // ---------------------------------------------------------------------------
