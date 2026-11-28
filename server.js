@@ -14,18 +14,26 @@
  * events at `/api/event`, PTY over WebSocket at `/api/pty/:id/connect`).
  *
  * This server plays the role the Electron main process plays on desktop:
- *   1. spawns the engine (`opencode serve`, extracted from the Linux deb)
- *      as a sidecar child process and reads the server password it prints;
+ *   1. gives every browser its own private space: an `oc_space` cookie maps
+ *      to a dedicated engine process (`opencode serve`) with its own session
+ *      database under /data/spaces/<id>/ — sessions, messages and auth of one
+ *      browser are never visible from another one;
  *   2. serves the built web UI statically at `/`;
- *   3. reverse-proxies `/api/*` to the engine — REST, SSE streaming and
- *      WebSocket upgrades — injecting the engine's Basic auth server-side
- *      so the browser never sees a credential;
- *   4. reports readiness at `/__status`.
+ *   3. reverse-proxies `/api/*` to that browser's engine — REST, SSE
+ *      streaming and WebSocket upgrades — injecting the engine's Basic auth
+ *      server-side so the browser never sees a credential;
+ *   4. reports readiness and capacity at `/__status` (aggregate — never
+ *      space ids, they are a capability).
+ *
+ * Idle spaces are reaped after 30 minutes without requests (their data stays
+ * on disk and returns on the next visit); at most MAX_RUNNING engines stay
+ * up at once so the box never runs out of RAM.
  *
  * Zero runtime dependencies: plain Node.js (>= 18).
  */
 
 import { spawn } from "node:child_process"
+import crypto from "node:crypto"
 import fs from "node:fs"
 import http from "node:http"
 import net from "node:net"
@@ -49,11 +57,21 @@ const ENGINE_BIN =
     : "opencode") // fall back to a system-installed opencode
 const ENGINE_PORT = process.env.ENGINE_PORT ? Number(process.env.ENGINE_PORT) : undefined
 // Working directory the engine operates on (the project the agent edits).
+// Shared by every space — sessions/messages are what is private, the project
+// checkout is the common workspace.
 const PROJECT_DIR = process.env.OPENCODE_PROJECT_DIR || process.cwd()
 const LOG_DIR = path.join(__dirname, "logs")
-// XDG root for engine state; on running.sh this is /data (container writable
-// layer — a deploy resets it, use the /__persist endpoints around deploys).
-const DATA_DIR = process.env.PERSIST_DIR || path.dirname(path.dirname(process.env.XDG_DATA_HOME || "/data/xdg/data"))
+// Root for engine state; on running.sh this is /data (a persistent volume).
+// Each browser space keeps its state under DATA_DIR/spaces/<id>/.
+const DATA_DIR = process.env.PERSIST_DIR || "/data"
+const SPACES_ROOT = path.join(DATA_DIR, "spaces")
+
+// Privacy / capacity knobs.
+const SPACE_COOKIE = "oc_space"
+const SPACE_ID_RE = /^[a-f0-9]{24}$/
+const MAX_SPACES = 24 // spaces remembered (their engines may be stopped)
+const MAX_RUNNING = 10 // engines kept up at once (RAM guard)
+const ENGINE_IDLE_MS = 30 * 60_000 // stop engines idle for this long
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -127,383 +145,27 @@ function pollReady(url, timeoutMs, intervalMs = 250) {
   })
 }
 
-// ---------------------------------------------------------------------------
-// Engine sidecar ("opencode serve"), the agent backend
-// ---------------------------------------------------------------------------
-
-const engine = {
-  child: null,
-  port: null,
-  password: null,
-  url: null,
-  ready: false,
-  version: null,
-  lastError: "",
-}
-
-function engineBase() {
-  return `http://127.0.0.1:${engine.port}`
-}
-
-async function startEngine() {
-  fs.mkdirSync(LOG_DIR, { recursive: true })
-  await ensureLocalProvider()
-  const logFile = fs.openSync(path.join(LOG_DIR, "engine.log"), "a")
-
-  return freePort().then((port) => {
-    engine.port = ENGINE_PORT || port
-    const args = ["serve", "--hostname", "127.0.0.1", "--port", String(engine.port)]
-    log(`starting engine: ${ENGINE_BIN} ${args.join(" ")} (project dir: ${PROJECT_DIR})`)
-    const child = spawn(ENGINE_BIN, args, {
-      cwd: PROJECT_DIR,
-      env: { ...process.env },
-      stdio: ["ignore", "pipe", "pipe"],
-    })
-    engine.child = child
-
-    let sawListening = false
-    let sawPassword = false
-    const onLine = (line) => {
-      // Example engine output:
-      //   server listening on http://127.0.0.1:4399
-      //   server password uhgAkr3-...
-      const listening = line.match(/server listening on (https?:\/\/\S+)/)
-      if (listening) {
-        sawListening = true
-        engine.url = listening[1]
-      }
-      const password = line.match(/server password\s+(\S+)/)
-      if (password) {
-        sawPassword = true
-        engine.password = password[1]
-      }
-    }
-    let stdoutBuf = ""
-    child.stdout.on("data", (chunk) => {
-      stdoutBuf += chunk.toString()
-      let idx
-      while ((idx = stdoutBuf.indexOf("\n")) !== -1) {
-        onLine(stdoutBuf.slice(0, idx))
-        stdoutBuf = stdoutBuf.slice(idx + 1)
-      }
-      fs.writeSync(logFile, chunk)
-    })
-    child.stderr.on("data", (chunk) => {
-      engine.lastError = chunk.toString().slice(0, 4000)
-      fs.writeSync(logFile, chunk)
-    })
-
-    const markReady = async () => {
-      // Poll in cycles; a stuck or slow boot self-heals: after ~45s without
-      // readiness the engine is restarted once, and polling continues for up
-      // to 10 minutes so a late boot never leaves a stale not-ready flag.
-      const deadline = Date.now() + 10 * 60_000
-      let restarts = 0
-      let cycles = 0
-      while (Date.now() < deadline && engine.child === child) {
-        cycles++
-        const up = await pollReady(`${engineBase()}/`, 15000, 500)
-        if (up) {
-          if (!sawPassword && restarts < 2) {
-            // A boot that never printed a server password would 401 every API
-            // call — useless. Restart the engine once and expect the line.
-            restarts++
-            log("engine ready but no server password was printed — restarting it once")
-            stopEngine()
-            await engineStopped()
-            if (engine.child === child) startEngine()
-            return // the new child runs its own markReady loop
-          }
-          engine.ready = true
-          log(`engine ready at ${engineBase()} (password ${sawPassword ? "captured" : "not required"})`)
-          return
-        }
-        if (engine.child !== child) return
-        if (cycles >= 3 && restarts < 1) {
-          restarts++
-          log("engine not ready after 45s — restarting it once")
-          stopEngine()
-          await engineStopped()
-          if (engine.child === child) startEngine()
-          return // the new child runs its own markReady loop
-        }
-        log(`engine still starting (cycle ${cycles})…`)
-      }
-      if (engine.child === child) {
-        engine.ready = false
-        log(`engine did not become ready in time; check ${LOG_DIR}/engine.log`)
-      }
-    }
-    markReady()
-
-    child.on("exit", (code, signal) => {
-      log(`engine exited (code=${code} signal=${signal})`)
-      engine.ready = false
-      // Self-heal: an unexpected exit (a crash — no SIGTERM/SIGINT signal) is
-      // restarted after a short delay so a transient failure never leaves the
-      // app dead. Intentional stops (persist dump/restore, SIGTERM) are not
-      // restarted here — their callers own the lifecycle.
-      if (!signal) {
-        setTimeout(() => {
-          if (!engine.child || engine.child.exitCode !== null) {
-            log("restarting engine after unexpected exit")
-            startEngine()
-          }
-        }, 3000)
-      }
-      // Do not flap forever; a supervisor (or a restart of this server) starts it again.
-    })
-    return child
-  })
-}
-
-function stopEngine() {
-  if (engine.child && engine.child.exitCode === null) {
-    log("stopping engine")
-    engine.child.kill("SIGTERM")
+function parseCookies(header) {
+  const out = {}
+  for (const part of String(header || "").split(";")) {
+    const idx = part.indexOf("=")
+    if (idx === -1) continue
+    out[part.slice(0, idx).trim()] = part.slice(idx + 1).trim()
   }
+  return out
 }
 
-// Wait until the current engine child is really gone; SIGKILL after 10s so a
-// wedged process can never hang a persist dump/restore (or a restart) forever.
-async function engineStopped() {
-  const deadline = Date.now() + 10_000
-  while (engine.child && engine.child.exitCode === null && Date.now() < deadline) {
-    await new Promise((ok) => setTimeout(ok, 200))
+// Attach a Set-Cookie header to a response header object without clobbering
+// whatever is already there.
+function withCookie(req, headers) {
+  if (req.__setSpaceCookie) {
+    const existing = headers["set-cookie"]
+    headers["set-cookie"] = existing
+      ? (Array.isArray(existing) ? existing : [existing]).concat(req.__setSpaceCookie)
+      : req.__setSpaceCookie
   }
-  if (engine.child && engine.child.exitCode === null) {
-    log("engine did not exit in 10s — SIGKILL")
-    engine.child.kill("SIGKILL")
-    await new Promise((ok) => setTimeout(ok, 500))
-  }
+  return headers
 }
-
-// ---------------------------------------------------------------------------
-// Engine-state persistence (deploy-time snapshot / restore)
-//
-// The engine keeps sessions, auth and config as SQLite + JSON under its XDG
-// dirs (DATA_DIR/xdg on the container filesystem). Container filesystems do
-// not survive a deploy, so before deploying, `scripts/persist-snapshot.sh`
-// saves this state over GET /__persist/dump and restores it after the deploy
-// over POST /__persist/restore (which restarts the engine so it reloads the
-// database). Both endpoints require the PERSIST_TOKEN secret header.
-// ---------------------------------------------------------------------------
-
-const PERSIST_TOKEN = process.env.PERSIST_TOKEN || ""
-const PERSIST_DIR = DATA_DIR
-
-function persistAllowed(req) {
-  return Boolean(PERSIST_TOKEN) && req.headers["x-persist-token"] === PERSIST_TOKEN
-}
-
-function restartEngine() {
-  stopEngine()
-  return engineStopped().then(() => startEngine())
-}
-
-async function persistDump(res) {
-  try {
-    const hadState = fs.existsSync(path.join(PERSIST_DIR, "xdg"))
-    const wasRunning = Boolean(engine.child && engine.child.exitCode === null)
-    if (!hadState) {
-      res.writeHead(200, { "content-type": "application/gzip" })
-      return res.end(Buffer.alloc(0))
-    }
-    if (wasRunning) {
-      log("dump: stopping engine for a consistent snapshot")
-      stopEngine()
-      await engineStopped()
-    }
-    try {
-      const tmp = path.join(os.tmpdir(), "persist-dump.tgz")
-      await new Promise((ok, err) => {
-        const tar = spawn(
-          "tar",
-          [
-            "czf", tmp,
-            // usage-backups are dead weight from the retired reset endpoint —
-            // they ballooned the payload past the ingress body limit once.
-            "--exclude=xdg/data/opencode/usage-backups",
-            "-C", PERSIST_DIR, "xdg",
-          ],
-          { stdio: ["ignore", "ignore", "pipe"] },
-        )
-        let msg = ""
-        tar.stderr.on("data", (c) => (msg += c))
-        tar.on("exit", (code) => (code === 0 ? ok() : err(new Error(`tar exit ${code}: ${msg.slice(0, 200)}`))))
-        tar.on("error", err)
-      })
-      if (wasRunning) startEngine()
-      const stream = fs.createReadStream(tmp)
-      res.writeHead(200, { "content-type": "application/gzip" })
-      stream.pipe(res)
-      stream.on("close", () => fs.unlink(tmp, () => {}))
-    } catch (err) {
-      if (wasRunning) startEngine()
-      throw err
-    }
-  } catch (err) {
-    log(`dump failed: ${err.message}`)
-    if (!res.headersSent) {
-      res.writeHead(500, { "content-type": "application/json" })
-    }
-    res.end(JSON.stringify({ error: err.message }))
-  }
-}
-
-async function persistRestore(req, res) {
-  const wasRunning = Boolean(engine.child && engine.child.exitCode === null)
-  try {
-    // Stop the engine BEFORE extracting. The running engine holds its SQLite
-    // WAL open; extracting the archive under it and only then restarting let
-    // the stale WAL checkpoint right back over the restored database — the
-    // restore "succeeded" and then silently reverted. Stopped engines
-    // checkpoint and drop their WAL on exit, so the extracted database is the
-    // only copy left on disk.
-    if (wasRunning) {
-      log("restore: stopping engine before extraction")
-      stopEngine()
-      await engineStopped()
-    }
-    const tmp = path.join(os.tmpdir(), "persist-restore.tgz")
-    const ws = fs.createWriteStream(tmp)
-    await new Promise((ok, err) => {
-      req.pipe(ws)
-      ws.on("finish", ok)
-      ws.on("error", err)
-    })
-    const size = fs.statSync(tmp).size
-    if (size > 0) {
-      fs.mkdirSync(PERSIST_DIR, { recursive: true })
-      await new Promise((ok, err) => {
-        const tar = spawn("tar", ["xzf", tmp, "-C", PERSIST_DIR], {
-          stdio: ["ignore", "ignore", "pipe"],
-        })
-        let msg = ""
-        tar.stderr.on("data", (c) => (msg += c))
-        tar.on("exit", (code) => (code === 0 ? ok() : err(new Error(`tar exit ${code}: ${msg.slice(0, 200)}`))))
-        tar.on("error", err)
-      })
-    } else {
-      log("restore: empty payload, nothing to extract")
-    }
-    fs.unlink(tmp, () => {})
-    log(`restored engine state (${size} bytes) — restarting engine`)
-    if (wasRunning) await restartEngine()
-    res.writeHead(200, { "content-type": "application/json" })
-    res.end(JSON.stringify({ restored: size, engineRestarted: wasRunning }))
-  } catch (err) {
-    log(`restore failed: ${err.message}`)
-    if (wasRunning && (!engine.child || engine.child.exitCode !== null)) startEngine()
-    res.writeHead(500, { "content-type": "application/json" })
-    res.end(JSON.stringify({ error: err.message }))
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Local models (Ollama running inside this container)
-//
-// The engine gets an "ollama" provider pointed at the in-container model
-// server (127.0.0.1:11434), so the model selector offers real local models:
-// no API keys, no provider-side metering — everything runs on this box's own
-// CPU/RAM. The provider entry is merged into the engine config on every
-// engine start (boot, restart, post-restore), so a config restore or a fresh
-// /data can never drop it. Anything else already in the config file is kept.
-// ---------------------------------------------------------------------------
-
-const ENGINE_CONFIG_DIR = path.join(DATA_DIR, "xdg", "config", "opencode")
-
-// Preferred tags (entrypoint.sh pulls these); whatever else exists in Ollama
-// (e.g. ":latest" variants pulled from a shell) is registered too, so the
-// model selector always reflects models that can actually answer.
-const PREFERRED_LOCAL_MODELS = ["qwen2.5-coder:1.5b", "llama3.2:3b", "qwen2.5-coder:7b"]
-
-const LOCAL_MODEL_NAMES = {
-  "qwen2.5-coder:1.5b": "Qwen2.5 Coder 1.5B",
-  "qwen2.5-coder:7b": "Qwen2.5 Coder 7B",
-  "qwen2.5-coder:latest": "Qwen2.5 Coder 7B",
-  "llama3.2:3b": "Llama 3.2 3B",
-  "llama3.2:latest": "Llama 3.2 3B",
-}
-
-// Merge actual Ollama tags with the preferred list (preferred first), then
-// drop a ":latest" variant only when a sibling tag of the same model really
-// exists in Ollama — every remaining id must be answerable.
-function localModelIds(actualNames) {
-  const actual = actualNames.filter(Boolean)
-  const merged = []
-  for (const p of PREFERRED_LOCAL_MODELS) if (actual.includes(p)) merged.push(p)
-  for (const a of actual) if (!merged.includes(a)) merged.push(a)
-  for (const p of PREFERRED_LOCAL_MODELS) if (!merged.includes(p)) merged.push(p)
-  return merged.filter((id) => {
-    if (!id.endsWith(":latest")) return true
-    const base = id.slice(0, -":latest".length)
-    return !actual.some((x) => x.startsWith(base + ":") && x !== id)
-  })
-}
-
-function localModelEntry(id) {
-  return {
-    name: LOCAL_MODEL_NAMES[id] || id,
-    tool_call: true,
-    cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
-    limit: { context: 16384, output: 8192 },
-  }
-}
-
-async function localOllamaTags() {
-  try {
-    const ctl = new AbortController()
-    const timer = setTimeout(() => ctl.abort(), 800)
-    const r = await fetch("http://127.0.0.1:11434/api/tags", { signal: ctl.signal })
-    clearTimeout(timer)
-    if (r.ok) return ((await r.json()).models || []).map((m) => m.name)
-  } catch {
-    // ollama not up yet
-  }
-  return []
-}
-
-async function ensureLocalProvider() {
-  const ids = localModelIds(await localOllamaTags())
-  const models = {}
-  for (const id of ids) models[id] = localModelEntry(id)
-  const provider = {
-    npm: "@ai-sdk/openai-compatible",
-    name: "Ollama (local)",
-    options: { baseURL: "http://127.0.0.1:11434/v1" },
-    models,
-  }
-  const cfgFile = path.join(ENGINE_CONFIG_DIR, "opencode.json")
-  let cfg = {}
-  try {
-    cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"))
-    if (!cfg || typeof cfg !== "object") cfg = {}
-  } catch {
-    cfg = {} // fresh box or no config yet — create one
-  }
-  cfg.provider = cfg.provider && typeof cfg.provider === "object" ? cfg.provider : {}
-  if (JSON.stringify(cfg.provider.ollama) === JSON.stringify(provider)) return
-  cfg.provider.ollama = provider
-  fs.mkdirSync(ENGINE_CONFIG_DIR, { recursive: true })
-  fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 2))
-  log(`local model provider (ollama @ 127.0.0.1:11434) ensured with models: ${ids.join(", ")}`)
-}
-
-// ---------------------------------------------------------------------------
-// /api/* proxy — REST + SSE (streaming) with server-side Basic auth
-// ---------------------------------------------------------------------------
-
-const HOP_BY_HOP = new Set([
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-])
 
 // Tail of a small log file for /__status (container debugging without a shell).
 function logTail(file, bytes = 2000) {
@@ -530,23 +192,448 @@ function dfStatus() {
   })
 }
 
-function proxyApi(req, res) {
-  const target = new URL(req.url, engineBase())
+function osInfo() {
+  try {
+    const rel = fs.readFileSync("/etc/os-release", "utf8")
+    const pick = (k) => (rel.match(new RegExp(`^${k}="?([^"\\n]*)`)) || [])[1]
+    return `${pick("PRETTY_NAME") || pick("NAME") || "Linux"} (${os.release()})`
+  } catch {
+    return `Linux (${os.release()})`
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Spaces — one private engine (and session database) per browser
+// ---------------------------------------------------------------------------
+
+const SPACES = new Map() // id -> space
+
+function newSpace(id) {
+  const space = {
+    id,
+    dir: path.join(SPACES_ROOT, id),
+    child: null,
+    port: null,
+    password: null,
+    url: null,
+    ready: false,
+    starting: false,
+    lastError: "",
+    lastSeen: Date.now(),
+    streams: 0, // open SSE / WebSocket connections — keep the engine while > 0
+  }
+  SPACES.set(id, space)
+  return space
+}
+
+// Resolve the space for a request; when the browser has no valid space cookie
+// yet, mint one and mark the response so every code path that writes headers
+// can hand it out (withCookie).
+function getSpace(req, res) {
+  let id = parseCookies(req.headers.cookie)[SPACE_COOKIE]
+  if (!id || !SPACE_ID_RE.test(id)) {
+    id = crypto.randomBytes(12).toString("hex")
+    if (res) {
+      req.__setSpaceCookie =
+        `${SPACE_COOKIE}=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`
+    }
+  }
+  let space = SPACES.get(id)
+  if (!space) {
+    while (SPACES.size >= MAX_SPACES) {
+      // Evict the least recently seen space (its data stays on disk; a
+      // returning browser recreates the object from its cookie).
+      let oldest = null
+      for (const s of SPACES.values()) {
+        if (!oldest || s.lastSeen < oldest.lastSeen) oldest = s
+      }
+      if (!oldest) break
+      stopEngineFor(oldest)
+      SPACES.delete(oldest.id)
+    }
+    space = newSpace(id)
+  }
+  space.lastSeen = Date.now()
+  return space
+}
+
+function engineBase(space) {
+  return `http://127.0.0.1:${space.port}`
+}
+
+async function ensureEngine(space) {
+  if (space.child && space.child.exitCode === null) return
+  if (space.starting) return
+  await startEngineFor(space)
+}
+
+async function startEngineFor(space) {
+  space.starting = true
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true })
+    fs.mkdirSync(path.join(space.dir, "data"), { recursive: true })
+    fs.mkdirSync(path.join(space.dir, "config"), { recursive: true })
+    fs.mkdirSync(`/tmp/spaces/${space.id}/cache`, { recursive: true })
+    const logFile = fs.openSync(path.join(LOG_DIR, `engine-${space.id}.log`), "a")
+
+    const port = await freePort()
+    space.port = ENGINE_PORT || port
+    const args = ["serve", "--hostname", "127.0.0.1", "--port", String(space.port)]
+    log(`[space ${space.id.slice(0, 8)}] starting engine on :${space.port}`)
+    const child = spawn(ENGINE_BIN, args, {
+      cwd: PROJECT_DIR,
+      env: {
+        ...process.env,
+        XDG_DATA_HOME: path.join(space.dir, "data"),
+        XDG_CONFIG_HOME: path.join(space.dir, "config"),
+        XDG_CACHE_HOME: `/tmp/spaces/${space.id}/cache`,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    space.child = child
+    child.on("error", (err) => {
+      // Spawn failure (e.g. ENGINE_BIN missing) — record it, never crash the
+      // whole server for one space's engine.
+      space.lastError = String((err && err.message) || err)
+      space.ready = false
+      space.starting = false
+      space.child = null
+      log(`[space ${space.id.slice(0, 8)}] engine spawn error: ${space.lastError}`)
+    })
+
+    let sawPassword = false
+    const onLine = (line) => {
+      // Example engine output:
+      //   server listening on http://127.0.0.1:4399
+      //   server password uhgAkr3-...
+      const listening = line.match(/server listening on (https?:\/\/\S+)/)
+      if (listening) space.url = listening[1]
+      const password = line.match(/server password\s+(\S+)/)
+      if (password) {
+        sawPassword = true
+        space.password = password[1]
+      }
+    }
+    let stdoutBuf = ""
+    child.stdout.on("data", (chunk) => {
+      stdoutBuf += chunk.toString()
+      let idx
+      while ((idx = stdoutBuf.indexOf("\n")) !== -1) {
+        onLine(stdoutBuf.slice(0, idx))
+        stdoutBuf = stdoutBuf.slice(idx + 1)
+      }
+      fs.writeSync(logFile, chunk)
+    })
+    child.stderr.on("data", (chunk) => {
+      space.lastError = chunk.toString().slice(0, 4000)
+      fs.writeSync(logFile, chunk)
+    })
+
+    const markReady = async () => {
+      // Poll in cycles; a stuck or slow boot self-heals: after ~45s without
+      // readiness the engine is restarted once, and polling continues for up
+      // to 10 minutes so a late boot never leaves a stale not-ready flag.
+      const deadline = Date.now() + 10 * 60_000
+      let restarts = 0
+      let cycles = 0
+      while (Date.now() < deadline && space.child === child) {
+        cycles++
+        const up = await pollReady(`${engineBase(space)}/`, 15000, 500)
+        if (up) {
+          if (!sawPassword && restarts < 2) {
+            // A boot that never printed a server password would 401 every API
+            // call — useless. Restart the engine and expect the line.
+            restarts++
+            log(`[space ${space.id.slice(0, 8)}] ready but no password printed — restarting`)
+            stopEngineFor(space)
+            await engineStoppedFor(space)
+            if (space.child === child) startEngineFor(space)
+            return // the new child runs its own markReady loop
+          }
+          space.ready = true
+          space.starting = false
+          log(`[space ${space.id.slice(0, 8)}] engine ready (password ${sawPassword ? "captured" : "not required"})`)
+          return
+        }
+        if (space.child !== child) return
+        if (cycles >= 3 && restarts < 1) {
+          restarts++
+          log(`[space ${space.id.slice(0, 8)}] not ready after 45s — restarting once`)
+          stopEngineFor(space)
+          await engineStoppedFor(space)
+          if (space.child === child) startEngineFor(space)
+          return
+        }
+      }
+      if (space.child === child) {
+        space.ready = false
+        space.starting = false
+        log(`[space ${space.id.slice(0, 8)}] engine did not become ready in time`)
+      }
+    }
+    markReady()
+
+    child.on("exit", (code, signal) => {
+      log(`[space ${space.id.slice(0, 8)}] engine exited (code=${code} signal=${signal})`)
+      space.ready = false
+      space.starting = false
+      // Self-heal: an unexpected exit (a crash — no signal) is restarted after
+      // a short delay, but only while the space is still in active use.
+      // Intentional stops (SIGTERM from the reaper / persist / shutdown) are
+      // not restarted here — their callers own the lifecycle.
+      if (!signal && Date.now() - space.lastSeen < 5 * 60_000) {
+        setTimeout(() => {
+          if (space.child === child && (!space.child || space.child.exitCode !== null)) {
+            log(`[space ${space.id.slice(0, 8)}] restarting engine after unexpected exit`)
+            startEngineFor(space)
+          }
+        }, 3000)
+      }
+    })
+    return child
+  } finally {
+    // starting stays true while markReady is pending for the first boot; it
+    // is cleared when ready/give-up happens. On early failure, clear it.
+    if (!space.child) space.starting = false
+  }
+}
+
+function stopEngineFor(space) {
+  if (space.child && space.child.exitCode === null) {
+    log(`[space ${space.id.slice(0, 8)}] stopping engine`)
+    space.child.kill("SIGTERM")
+  }
+}
+
+// Wait until the space's engine child is really gone; SIGKILL after 10s so a
+// wedged process can never hang a reaper / persist dump / restore forever.
+async function engineStoppedFor(space) {
+  const deadline = Date.now() + 10_000
+  while (space.child && space.child.exitCode === null && Date.now() < deadline) {
+    await new Promise((ok) => setTimeout(ok, 200))
+  }
+  if (space.child && space.child.exitCode === null) {
+    log(`[space ${space.id.slice(0, 8)}] engine did not exit in 10s — SIGKILL`)
+    space.child.kill("SIGKILL")
+    await new Promise((ok) => setTimeout(ok, 500))
+  }
+}
+
+// Reaper: stop engines that have had no requests (and no open streams) for
+// ENGINE_IDLE_MS, and enforce the MAX_RUNNING RAM guard LRU-style.
+setInterval(() => {
+  const now = Date.now()
+  let running = []
+  for (const s of SPACES.values()) {
+    if (s.child && s.child.exitCode === null) running.push(s)
+    if (
+      s.child &&
+      s.child.exitCode === null &&
+      s.streams === 0 &&
+      now - s.lastSeen > ENGINE_IDLE_MS
+    ) {
+      log(`reaping idle engine (space ${s.id.slice(0, 8)})`)
+      stopEngineFor(s)
+    }
+  }
+  running = running.filter((s) => s.child && s.child.exitCode === null)
+  if (running.length > MAX_RUNNING) {
+    running.sort((a, b) => a.lastSeen - b.lastSeen)
+    for (const s of running) {
+      if (running.length <= MAX_RUNNING) break
+      if (s.streams > 0) continue // do not pull the ground from an open tab
+      log(`RAM guard: stopping LRU engine (space ${s.id.slice(0, 8)})`)
+      stopEngineFor(s)
+      running.splice(running.indexOf(s), 1)
+    }
+  }
+}, 60_000).unref()
+
+// ---------------------------------------------------------------------------
+// Engine-state persistence (deploy-time snapshot / restore)
+//
+// Engine state lives under DATA_DIR (the /data volume: legacy xdg/ plus every
+// space's directory). Before deploying, `scripts/persist-snapshot.sh` saves
+// it over GET /__persist/dump and restores it after the deploy over POST
+// /__persist/restore (all engines are stopped for a consistent snapshot and
+// restarted afterwards). Both endpoints require the PERSIST_TOKEN secret.
+// ---------------------------------------------------------------------------
+
+const PERSIST_TOKEN = process.env.PERSIST_TOKEN || ""
+const PERSIST_DIR = DATA_DIR
+
+function persistAllowed(req) {
+  return Boolean(PERSIST_TOKEN) && req.headers["x-persist-token"] === PERSIST_TOKEN
+}
+
+async function stopAllEngines() {
+  const running = []
+  for (const s of SPACES.values()) {
+    if (s.child && s.child.exitCode === null) {
+      stopEngineFor(s)
+      running.push(s)
+    }
+  }
+  await Promise.all(running.map((s) => engineStoppedFor(s)))
+  return running
+}
+
+async function persistDump(res) {
+  const candidates = ["xdg", "spaces"]
+  const existing = candidates.filter((d) => fs.existsSync(path.join(PERSIST_DIR, d)))
+  try {
+    if (existing.length === 0) {
+      res.writeHead(200, { "content-type": "application/gzip" })
+      return res.end(Buffer.alloc(0))
+    }
+    const wasRunning = await stopAllEngines()
+    try {
+      const tmp = path.join(os.tmpdir(), "persist-dump.tgz")
+      await new Promise((ok, err) => {
+        const tar = spawn(
+          "tar",
+          [
+            "czf", tmp,
+            // usage-backups are dead weight from the retired reset endpoint —
+            // they ballooned the payload past the ingress body limit once.
+            "--exclude=xdg/data/opencode/usage-backups",
+            "-C", PERSIST_DIR, ...existing,
+          ],
+          { stdio: ["ignore", "ignore", "pipe"] },
+        )
+        let msg = ""
+        tar.stderr.on("data", (c) => (msg += c))
+        tar.on("exit", (code) => (code === 0 ? ok() : err(new Error(`tar exit ${code}: ${msg.slice(0, 200)}`))))
+        tar.on("error", err)
+      })
+      for (const s of wasRunning) startEngineFor(s)
+      const stream = fs.createReadStream(tmp)
+      res.writeHead(200, { "content-type": "application/gzip" })
+      stream.pipe(res)
+      stream.on("close", () => fs.unlink(tmp, () => {}))
+    } catch (err) {
+      for (const s of wasRunning) startEngineFor(s)
+      throw err
+    }
+  } catch (err) {
+    log(`dump failed: ${err.message}`)
+    if (!res.headersSent) {
+      res.writeHead(500, { "content-type": "application/json" })
+    }
+    res.end(JSON.stringify({ error: err.message }))
+  }
+}
+
+async function persistRestore(req, res) {
+  try {
+    // Stop the engines BEFORE extracting. Running engines hold their SQLite
+    // WALs open; extracting the archive under them and only then restarting
+    // let the stale WAL checkpoint right back over the restored databases.
+    const wasRunning = await stopAllEngines()
+    const tmp = path.join(os.tmpdir(), "persist-restore.tgz")
+    const ws = fs.createWriteStream(tmp)
+    await new Promise((ok, err) => {
+      req.pipe(ws)
+      ws.on("finish", ok)
+      ws.on("error", err)
+    })
+    const size = fs.statSync(tmp).size
+    if (size > 0) {
+      fs.mkdirSync(PERSIST_DIR, { recursive: true })
+      await new Promise((ok, err) => {
+        const tar = spawn("tar", ["xzf", tmp, "-C", PERSIST_DIR], {
+          stdio: ["ignore", "ignore", "pipe"],
+        })
+        let msg = ""
+        tar.stderr.on("data", (c) => (msg += c))
+        tar.on("exit", (code) => (code === 0 ? ok() : err(new Error(`tar exit ${code}: ${msg.slice(0, 200)}`))))
+        tar.on("error", err)
+      })
+    } else {
+      log("restore: empty payload, nothing to extract")
+    }
+    fs.unlink(tmp, () => {})
+    log(`restored engine state (${size} bytes) — restarting engines`)
+    for (const s of wasRunning) startEngineFor(s)
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ restored: size, enginesRestarted: wasRunning.length }))
+  } catch (err) {
+    log(`restore failed: ${err.message}`)
+    res.writeHead(500, { "content-type": "application/json" })
+    res.end(JSON.stringify({ error: err.message }))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy cleanup — the retired local-model (Ollama) setup
+//
+// The models are gone; free their storage and make sure no engine config
+// still carries the dead "ollama" provider (it would show unanswerable
+// models in the selector).
+// ---------------------------------------------------------------------------
+
+function cleanupLegacyOllama() {
+  const cfgFiles = [
+    path.join(DATA_DIR, "xdg", "config", "opencode", "opencode.json"),
+    path.join(DATA_DIR, "xdg", "config", "opencode", "config.json"),
+  ]
+  for (const cfgFile of cfgFiles) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"))
+      if (cfg && cfg.provider && cfg.provider.ollama) {
+        delete cfg.provider.ollama
+        if (!Object.keys(cfg.provider).length) delete cfg.provider
+        fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 2))
+        log(`legacy config: removed ollama provider from ${cfgFile}`)
+      }
+    } catch {
+      // no config / not JSON — nothing to clean
+    }
+  }
+  for (const dir of ["/var/lib/ollama", "/data/ollama"]) {
+    try {
+      if (fs.existsSync(dir)) {
+        fs.rmSync(dir, { recursive: true, force: true })
+        log(`legacy cleanup: removed ${dir}`)
+      }
+    } catch {
+      // best effort
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /api/* proxy — REST + SSE (streaming) with server-side Basic auth
+// ---------------------------------------------------------------------------
+
+const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+])
+
+function proxyApi(req, res, space) {
+  const target = new URL(req.url, engineBase(space))
   const headers = {}
   for (const [name, value] of Object.entries(req.headers)) {
     if (HOP_BY_HOP.has(name.toLowerCase())) continue
     headers[name] = value
   }
-  headers.host = `127.0.0.1:${engine.port}`
-  if (engine.password) {
+  headers.host = `127.0.0.1:${space.port}`
+  if (space.password) {
     headers.authorization =
-      "Basic " + Buffer.from(`opencode:${engine.password}`).toString("base64")
+      "Basic " + Buffer.from(`opencode:${space.password}`).toString("base64")
   }
 
   const upstream = http.request(
     {
       hostname: "127.0.0.1",
-      port: engine.port,
+      port: space.port,
       path: target.pathname + target.search,
       method: req.method,
       headers,
@@ -557,8 +644,15 @@ function proxyApi(req, res) {
         if (HOP_BY_HOP.has(name.toLowerCase())) continue
         resHeaders[name] = value
       }
+      withCookie(req, resHeaders)
       res.writeHead(upRes.statusCode || 502, resHeaders)
       upRes.pipe(res) // streams SSE/chunked bodies through untouched
+      // A live SSE stream (the UI's event feed) keeps this space's engine on.
+      const ctype = String(upRes.headers["content-type"] || "")
+      if (ctype.includes("text/event-stream")) {
+        space.streams++
+        res.on("close", () => (space.streams = Math.max(0, space.streams - 1)))
+      }
     },
   )
 
@@ -577,13 +671,13 @@ function proxyApi(req, res) {
 // /api/* WebSocket upgrade proxy (PTY terminals, MCP connects)
 // ---------------------------------------------------------------------------
 
-function proxyUpgrade(req, socket, head) {
-  const target = new URL(req.url, engineBase())
+function proxyUpgrade(req, socket, head, space) {
+  const target = new URL(req.url, engineBase(space))
   const headers = { ...req.headers }
-  headers.host = `127.0.0.1:${engine.port}`
-  if (engine.password) {
+  headers.host = `127.0.0.1:${space.port}`
+  if (space.password) {
     headers.authorization =
-      "Basic " + Buffer.from(`opencode:${engine.password}`).toString("base64")
+      "Basic " + Buffer.from(`opencode:${space.password}`).toString("base64")
   }
   delete headers.connection
   // Reconstruct the request line verbatim; ws handshake requires raw forwarding.
@@ -592,17 +686,21 @@ function proxyUpgrade(req, socket, head) {
     ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`),
     "\r\n",
   ]
-  const upstream = net.connect(engine.port, "127.0.0.1", () => {
+  const upstream = net.connect(space.port, "127.0.0.1", () => {
     upstream.write(lines.join("\r\n"))
     if (head && head.length) upstream.write(head)
     upstream.pipe(socket)
     socket.pipe(upstream)
   })
+  space.streams++
   upstream.on("error", () => {
     socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
   })
   socket.on("error", () => upstream.destroy())
-  socket.on("close", () => upstream.destroy())
+  socket.on("close", () => {
+    upstream.destroy()
+    space.streams = Math.max(0, space.streams - 1)
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -620,7 +718,7 @@ function serveStatic(req, res) {
     fs.stat(candidate, (err, stat) => {
       if (!err && stat.isFile()) {
         const type = MIME[path.extname(candidate).toLowerCase()] || "application/octet-stream"
-        res.writeHead(200, { "content-type": type, "content-length": stat.size })
+        res.writeHead(200, withCookie(req, { "content-type": type, "content-length": stat.size }))
         fs.createReadStream(candidate).pipe(res)
         return
       }
@@ -638,46 +736,32 @@ function serveStatic(req, res) {
 }
 
 // ---------------------------------------------------------------------------
-// Status endpoint
+// Status endpoint (aggregate — never leaks space ids)
 // ---------------------------------------------------------------------------
 
-async function serveStatus(res) {
-  // Local model server (Ollama) liveness, so /__status shows the whole stack.
-  let local = { ready: false, models: [] }
-  try {
-    const ctl = new AbortController()
-    const timer = setTimeout(() => ctl.abort(), 800)
-    const r = await fetch("http://127.0.0.1:11434/api/tags", { signal: ctl.signal })
-    clearTimeout(timer)
-    if (r.ok) {
-      const tags = await r.json()
-      local.ready = true
-      local.models = (tags.models || []).map((m) => m.name)
-    }
-  } catch {
-    // ollama not up yet — reported as ready: false
-  }
+async function serveStatus(req, res) {
   const disk = await dfStatus()
-  res.writeHead(200, { "content-type": "application/json; charset=utf-8" })
+  const spaces = [...SPACES.values()]
+  res.writeHead(200, withCookie(req, { "content-type": "application/json; charset=utf-8" }))
   res.end(
     JSON.stringify(
       {
         app: "opencode-web",
         version: "2.4.2",
-        engine: {
-          ready: engine.ready,
-          url: engine.url,
-          port: engine.port,
-          pid: engine.child?.pid,
-          version: engine.version,
-          hasPassword: Boolean(engine.password),
-          lastError: engine.lastError || undefined,
+        os: osInfo(),
+        spaces: {
+          total: spaces.length,
+          enginesRunning: spaces.filter((s) => s.child && s.child.exitCode === null).length,
+          enginesReady: spaces.filter((s) => s.ready).length,
+          detail: spaces.map((s) => ({
+            id: s.id.slice(0, 8),
+            ready: s.ready,
+            streams: s.streams,
+            idleForSec: Math.round((Date.now() - s.lastSeen) / 1000),
+            lastError: s.lastError || undefined,
+          })),
         },
-        localModels: local,
         disk,
-        engineLogTail: logTail(path.join(LOG_DIR, "engine.log")),
-        pullLogTail: logTail("/tmp/ollama-pull.log"),
-        ollamaLogTail: logTail("/tmp/ollama.log", 800),
         webDir: path.basename(WEB_DIR),
         projectDir: PROJECT_DIR,
         persist: Boolean(PERSIST_TOKEN),
@@ -694,17 +778,17 @@ async function serveStatus(res) {
 // ---------------------------------------------------------------------------
 
 // When no built renderer is present (e.g. a slim container image), the UI is
-// served by the engine itself — it embeds the official web build — through the
-// same authenticated proxy.
+// served by the engine itself — it embeds the official web build — through
+// the same authenticated proxy.
 const STATIC_FROM_ENGINE = !fs.existsSync(path.join(WEB_DIR, "index.html"))
 
-function serveSplash(res) {
-  res.writeHead(200, { "content-type": "text/html; charset=utf-8", "retry-after": "2" })
+function serveSplash(req, res) {
+  res.writeHead(200, withCookie(req, { "content-type": "text/html; charset=utf-8", "retry-after": "2" }))
   res.end(
     `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="2">` +
       `<title>OpenCode Web — starting</title></head>` +
       `<body style="font-family:system-ui;background:#fafafa;color:#333;display:grid;place-items:center;height:100vh;margin:0">` +
-      `<div style="text-align:center"><h1>OpenCode Web</h1><p>The engine is starting…</p></div></body></html>`,
+      `<div style="text-align:center"><h1>OpenCode Web</h1><p>Preparing your private workspace…</p></div></body></html>`,
   )
 }
 
@@ -723,22 +807,43 @@ const server = http.createServer((req, res) => {
     }
     return persistRestore(req, res)
   }
-  if (req.url.startsWith("/__status")) return serveStatus(res)
+  if (req.url.startsWith("/__status")) return serveStatus(req, res)
+  // Everything below is space-scoped: the cookie decides which engine — and
+  // therefore which set of sessions — a browser talks to.
+  const space = getSpace(req, res)
   if (req.url === "/api" || req.url.startsWith("/api/")) {
-    if (!engine.ready) {
-      res.writeHead(503, { "content-type": "application/json" })
-      return res.end(JSON.stringify({ error: "engine-starting", detail: engine.lastError || undefined }))
+    ensureEngine(space)
+    if (!space.ready) {
+      res.writeHead(503, withCookie(req, { "content-type": "application/json" }))
+      return res.end(JSON.stringify({ error: "engine-starting", detail: space.lastError || undefined }))
     }
-    return proxyApi(req, res)
+    return proxyApi(req, res, space)
   }
-  if (!engine.ready) return serveSplash(res)
-  if (STATIC_FROM_ENGINE) return proxyApi(req, res)
+  if (!space.ready) {
+    ensureEngine(space)
+    return serveSplash(req, res)
+  }
+  if (STATIC_FROM_ENGINE) return proxyApi(req, res, space)
   return serveStatic(req, res)
 })
 
 server.on("upgrade", (req, socket, head) => {
-  if (req.url.startsWith("/api/")) return proxyUpgrade(req, socket, head)
-  socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+  if (!req.url.startsWith("/api/")) {
+    return socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+  }
+  // A WebSocket handshake without a space cookie cannot be paired with the
+  // engine the page loaded against — bounce it; the page carries the cookie.
+  const id = parseCookies(req.headers.cookie)[SPACE_COOKIE]
+  if (!id || !SPACE_ID_RE.test(id) || !SPACES.has(id)) {
+    return socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
+  }
+  const space = SPACES.get(id)
+  space.lastSeen = Date.now()
+  if (!space.ready) {
+    ensureEngine(space)
+    return socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
+  }
+  return proxyUpgrade(req, socket, head, space)
 })
 
 async function main() {
@@ -746,21 +851,19 @@ async function main() {
     log(`FATAL: web UI directory not found: ${WEB_DIR}`)
     process.exit(1)
   }
-  await startEngine()
+  cleanupLegacyOllama()
   server.listen(PORT, HOST, () => {
     log(`OpenCode Web listening on http://${HOST}:${PORT} (web UI: ${WEB_DIR})`)
-    log(`status: http://localhost:${PORT}/__status`)
+    log(`status: http://localhost:${PORT}/__status — each browser gets its own private space`)
   })
 }
 
-process.on("SIGINT", () => {
-  stopEngine()
+function shutdown() {
+  for (const s of SPACES.values()) stopEngineFor(s)
   process.exit(0)
-})
-process.on("SIGTERM", () => {
-  stopEngine()
-  process.exit(0)
-})
+}
+process.on("SIGINT", shutdown)
+process.on("SIGTERM", shutdown)
 
 main().catch((err) => {
   log("fatal:", err)
