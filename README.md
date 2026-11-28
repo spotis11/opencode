@@ -81,6 +81,24 @@ GPU-less flag and Debian release:
 - everything the agent installs into the workspace (e.g. `pip install`) also
   lands in this Debian environment
 
+## Live preview dashboard (z.ai-style)
+
+Tell the agent to **start the dev server** (or "make me a website" →
+`npm run dev`) and the shell detects the listening port within seconds by
+watching `/proc/net/tcp`. A green **Dashboard** pill appears in the app and
+the preview panel opens automatically: dark toolbar with the preview URL
+(click to open in a new tab), copy-URL, refresh, device-width toggle and the
+live app in an iframe below — the z.ai sandbox experience, on your own box.
+
+- Every detected server is reachable at `/preview/<port>/` — HTTP **and**
+  WebSocket are proxied, plus a Referer-based fallback forwards the
+  previewed app's absolute-path assets/fetches, so Vite/Next/CRA dev
+  servers work unchanged behind the prefix (HMR included).
+- `GET /__preview` lists live servers (port, URL, page title); `/__status`
+  carries the same list. The dashboard polls it every 2.5 s.
+- The web shell's own port and the engine ports are never exposed as
+  previews; non-HTTP listeners are detected but hidden from the panel.
+
 ## Deploy
 
 ### Docker
