@@ -898,6 +898,7 @@ const PREVIEW_PANEL_CSS = `
 #ocp-pill{position:fixed;right:18px;bottom:18px;z-index:2147483000;display:flex;align-items:center;gap:8px;padding:10px 15px;border-radius:999px;background:#171717;color:#e7e7e7;font:500 13px/1 system-ui,-apple-system,sans-serif;border:1px solid #2e2e2e;box-shadow:0 6px 24px rgba(0,0,0,.45);cursor:pointer;user-select:none}
 #ocp-pill:hover{background:#202020}
 .ocp-dot{width:8px;height:8px;border-radius:50%;background:#22c55e;animation:ocp-pulse 1.6s infinite}
+.ocp-dot.ocp-idle{background:#6b7280;animation:none}
 @keyframes ocp-pulse{0%{box-shadow:0 0 0 0 rgba(34,197,94,.5)}70%{box-shadow:0 0 0 8px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
 .ocp-off{display:none!important}
 #ocp-drawer{position:fixed;top:0;right:0;height:100vh;width:min(560px,62vw);background:#111;border-left:1px solid #2a2a2a;z-index:2147483001;transform:translateX(102%);transition:transform .22s ease;display:flex;flex-direction:column}
@@ -1035,7 +1036,12 @@ const PREVIEW_PANEL_JS = `(function () {
       msg.classList.add("ocp-off")
       if (st.open) ensureFrame()
     }
-    pill.classList.toggle("ocp-off", st.open || !st.servers.length)
+    pill.classList.toggle("ocp-off", st.open)
+    var dot = pill.querySelector(".ocp-dot")
+    if (dot) dot.classList.toggle("ocp-idle", !st.servers.length)
+    pill.title = st.servers.length
+      ? st.servers.length + " dev server" + (st.servers.length > 1 ? "s" : "") + " running"
+      : "No dev server running \\u2014 ask the agent to start one"
     if (st.servers.length && !st.open && st.lastCount === 0 && Date.now() - st.dismissed > 1500) show(true)
     st.lastCount = st.servers.length
   }
