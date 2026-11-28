@@ -20,10 +20,9 @@ sessions, diffs, review, terminal panel, themes — is the desktop app's own UI.
 
 | Path           | What it is                                                                    |
 | -------------- | ----------------------------------------------------------------------------- |
-| `server.js`    | The Node.js shell: static hosting, API proxy, engine sidecar (0 dependencies) |
+| `server.js`    | The Node.js shell: static hosting, API proxy, per-browser engine spaces (0 dependencies) |
 | `web/`         | The renderer, **built from source** with `vite build` (`packages/app`)        |
 | `engine/opencode` | The `opencode` CLI, extracted from the official Linux `.deb` (v2.4.2)      |
-| `entrypoint.sh`   | Container startup: brings up Ollama (local models) before the web shell    |
 | `docs/`        | Screenshots taken while verifying the app in a real browser                   |
 | `dev/build-from-source.sh` | Rebuilds `web/` from the upstream monorepo source                  |
 
@@ -51,55 +50,44 @@ Configuration (environment variables):
 | `OPENCODE_PROJECT_DIR` | current directory              | The project the agent works on           |
 | `WEB_DIR`              | `./web`                        | Built renderer directory                 |
 
-Health: `GET /__status` shows whether the engine is up, its port and PID,
-and whether the local model server is ready (with its model list).
+Health: `GET /__status` shows the OS, disk, and the space summary (how many
+browsers have visited, how many engines are running/ready — never space ids).
 
-## Local models (run inside the box)
+## Privacy: one private workspace per browser
 
-The Docker image bundles **Ollama** and three models, served on
-`127.0.0.1:11434` — real models running on the machine itself, with no API
-key and nothing metered anywhere. The weights are pulled on first boot into
-the container's main disk (`/var/lib/ollama/models`, ~18 GB free; re-pulled
-automatically after deploys), so the image itself stays small and the
-persistent `/data` volume (a 1 GB loop device holding only the engine state)
-is never crowded:
+Every browser that opens the app gets its own **space**: an `oc_space` cookie
+maps to a dedicated engine process with its own session database under
+`/data/spaces/<id>/`. Your tabs, sessions, messages and provider logins are
+visible only in your browser — opening the site in another browser (or on
+another device) starts an empty space and cannot see yours, and you cannot
+see theirs. No login needed; the cookie is the key (HttpOnly, one year).
 
-| Model                | Size    | Good for                  |
-| -------------------- | ------- | ------------------------- |
-| `qwen2.5-coder:1.5b` | ~1.0 GB | Fast edits and quick chat |
-| `llama3.2:3b`        | ~2.0 GB | General chat              |
-| `qwen2.5-coder:7b`   | ~4.7 GB | Quality coding (heavier)  |
+Capacity is managed automatically: idle engines are stopped after 30 minutes
+without requests (their data stays and reappears on your next visit), and at
+most ten engines run at once — least recently used ones are stopped first.
 
-They appear in the composer's model selector under **Ollama (local)** — pick
-one like any cloud model and the engine talks to localhost. Cost shows as 0:
-every token comes from the container's own CPU, not from any provider quota.
+## A full Debian sandbox
 
-On the running.sh standard-4 instance (12 GB RAM / 20 GB storage / 4 vCPU)
-the 7B model holds comfortably in RAM. Generation is fully CPU-based, so it
-is slower than a hosted API (roughly 5–8 tokens/s on 7B, noticeably faster
-on 1.5B/3B), the very first boot — and the first boot after every deploy —
-downloads the weights (~7.7 GB total, about a minute at datacenter
-bandwidth), and the first message after a cold start pays a one-off model
-load of tens of seconds, after which the model stays warm for 10 minutes.
+The container is a real **Debian** userland (`node:22-slim`), and the agent's
+shell runs inside it: ask any AI model in the app to "run fastfetch" and it
+executes `fastfetch` right there — you get this machine's actual CPU, RAM,
+GPU-less flag and Debian release:
 
-`entrypoint.sh` starts Ollama before the web shell and pulls any missing
-models in the background (`/__status` reports what is ready), and
-`server.js` merges the `ollama` provider into the engine config on every
-engine start, so local models survive config restores and fresh `/data`
-volumes. Outside Docker, run `ollama serve` yourself and the same selector
-works.
+- `python3` + `pip` + `venv`, `git`, `build-essential` (gcc/g++, make),
+  `ripgrep`, `jq`, `sqlite3`, `htop`, `tree`, `nano`, `less`, `man-db`,
+  network tools, zip/unzip/xz, `openssh-client`
+- **`fastfetch`** — installed from the official release `.deb`, so the
+  classic "show me the specs" command just works
+- everything the agent installs into the workspace (e.g. `pip install`) also
+  lands in this Debian environment
 
 ## Deploy
 
 ### Docker
 
 The `Dockerfile` in this directory builds the UI **from the upstream monorepo
-source** (Bun + Vite) and downloads the engine from the official 2.4.2
-package. The local models are not baked into the image: `entrypoint.sh`
-pulls them on first boot into `OLLAMA_MODELS` (default
-`/var/lib/ollama/models` on the container's main disk), so the build stays
-small — point `OLLAMA_MODELS` at a volume to keep weights across container
-rebuilds:
+source** (Bun + Vite), downloads the engine from the official 2.4.2 package
+and installs the Debian sandbox tools including `fastfetch`:
 
 ```bash
 docker build -t opencode-web .
@@ -112,19 +100,20 @@ serves the engine's embedded web build instead — the same official UI.
 ### running.sh
 
 Deployed live at a `*.running.sh` URL as a **standard-4** container (12 GB
-RAM, 20 GB storage, 4 vCPU — sized to also run the local models above; this
-directory's `Dockerfile` is detected from the GitHub repo and built; port
-8080, healthcheck `/__status`, sleeps after 30 min idle and wakes on request,
-so compute is only billed while it is awake).
+RAM, 20 GB storage, 4 vCPU; this directory's `Dockerfile` is detected from
+the GitHub repo and built; port 8080, healthcheck `/__status`, sleeps after
+30 min idle and wakes on request, so compute is only billed while it is
+awake).
 
 > Sizing note: the free **lite** instance (256 MiB) cannot hold the Node proxy
 > plus the Bun-compiled engine — containers serve for ~90 s and are then
 > OOM-killed in a loop (SIGKILL 137). Use standard-1 or bigger.
 
 **State across deploys** (`scripts/persist-snapshot.sh save|restore|deploy`):
-a deploy resets the container filesystem, so `server.js` exposes
-`GET /__persist/dump` (stops engine → consistent tar of `/data/xdg` → restarts)
-and `POST /__persist/restore` (extract + engine restart), gated by a
+`/data` is a persistent volume, so spaces survive deploys on their own;
+`server.js` additionally exposes `GET /__persist/dump` (stops all engines →
+consistent tar of `/data`: legacy state plus every space → restarts) and
+`POST /__persist/restore` (extract + engine restart), gated by a
 `PERSIST_TOKEN` secret. Verified end to end: sessions created before a deploy
 are still there after it.
 
@@ -139,9 +128,8 @@ see `scripts/deploy-running.sh` and `scripts/persist-snapshot.sh`.
    mentions, image attachments, agent selection (Build / Plan / Big Pickle).
 3. The engine is the real OpenCode v2 engine: sign in to a provider with
    `./engine/opencode auth login` (or set up `opencode.json` in your project
-   directory) for cloud models — or just pick one of the **Ollama (local)**
-   models in the composer's model selector, which need no sign-in at all and
-   run entirely inside the machine.
+   directory) for cloud models. Provider logins are per-browser too — they
+   live in your space's config, not in anyone else's.
 
 The project the agent operates on defaults to the directory you started
 `server.js` from (override with `OPENCODE_PROJECT_DIR`). The UI detects its
