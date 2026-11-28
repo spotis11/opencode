@@ -23,7 +23,13 @@
  *      streaming and WebSocket upgrades — injecting the engine's Basic auth
  *      server-side so the browser never sees a credential;
  *   4. reports readiness and capacity at `/__status` (aggregate — never
- *      space ids, they are a capability).
+ *      space ids, they are a capability);
+ *   5. watches /proc/net/tcp for dev servers the agent starts in the sandbox
+ *      ("start the dev server" → `npm run dev`), exposes each under
+ *      /preview/<port>/ (HTTP + WebSocket/HMR proxy with a Referer fallback
+ *      for the previewed app's absolute paths), reports them at /__preview,
+ *      and a tiny dashboard script injected into the UI opens a z.ai-style
+ *      preview panel automatically.
  *
  * Idle spaces are reaped after 30 minutes without requests (their data stays
  * on disk and returns on the next visit); at most MAX_RUNNING engines stay
@@ -450,6 +456,182 @@ setInterval(() => {
 }, 60_000).unref()
 
 // ---------------------------------------------------------------------------
+// Dev-server preview (z.ai-style dashboard)
+//
+// When the agent starts a dev server in the sandbox ("make me a website" →
+// `npm run dev`), this shell detects the listening port by watching
+// /proc/net/tcp, exposes the app under /preview/<port>/ (HTTP + WebSocket for
+// HMR, with a Referer fallback so the previewed app's absolute-path assets
+// and API calls keep working behind the prefix), reports the list at
+// /__preview, and the injected dashboard script opens the preview panel.
+// ---------------------------------------------------------------------------
+
+const PREVIEW_RE = /^\/preview\/(\d{2,5})(\/.*)?$/
+const previewServers = new Map() // port -> { port, since, title, http, tries }
+
+function listeningPorts() {
+  const ports = new Set()
+  for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let text
+    try {
+      text = fs.readFileSync(file, "utf8")
+    } catch {
+      continue
+    }
+    for (const line of text.split("\n").slice(1)) {
+      const cols = line.trim().split(/\s+/)
+      if (cols.length < 4 || cols[3] !== "0A") continue // 0A = LISTEN
+      const local = cols[1]
+      const port = parseInt(local.slice(local.lastIndexOf(":") + 1), 16)
+      if (Number.isFinite(port) && port >= 1024 && port <= 65535) ports.add(port)
+    }
+  }
+  return ports
+}
+
+// Single-shot listener check for a direct preview hit — covers the ≤2s window
+// before the periodic scanner registers a freshly started dev server.
+function listeningPortOnce(port) {
+  return listeningPorts().has(port)
+}
+
+// Never proxy our own port (loop) or an engine port (auth boundary) as a
+// preview — those are reserved even if something listens on them.
+function reservedPreviewPorts() {
+  const reserved = new Set([PORT])
+  for (const s of SPACES.values()) if (s.port) reserved.add(s.port)
+  return reserved
+}
+
+// Probe a listening port once: does it speak HTTP (dashboard candidate), and
+// what <title> does its index page carry (best-effort)?
+async function probeHttp(port) {
+  try {
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), 1200)
+    const r = await fetch(`http://127.0.0.1:${port}/`, { signal: ctl.signal })
+    clearTimeout(timer)
+    let title = null
+    const ctype = r.headers.get("content-type") || ""
+    if (ctype.includes("text/html")) {
+      try {
+        const head = (await r.text()).slice(0, 4000)
+        const m = head.match(/<title[^>]*>([^<]{1,80})<\/title>/i)
+        if (m) title = m[1].trim()
+      } catch {
+        // body unreadable — the HTTP response itself is still proof enough
+      }
+    }
+    return { http: true, title }
+  } catch {
+    return { http: false, title: null }
+  }
+}
+
+setInterval(() => {
+  const reserved = reservedPreviewPorts()
+  const seen = new Set()
+  for (const port of listeningPorts()) {
+    if (reserved.has(port)) continue
+    seen.add(port)
+    const entry = previewServers.get(port)
+    if (!entry) {
+      previewServers.set(port, { port, since: Date.now(), title: null, http: false, tries: 0 })
+      log(`preview: server detected on :${port}`)
+    } else if (!entry.http && entry.tries < 30) {
+      // Not confirmed as HTTP yet (still compiling, or a non-HTTP service) —
+      // keep probing quietly for up to ~1 minute, then stop trying.
+    } else {
+      continue
+    }
+    const e = previewServers.get(port)
+    e.tries++
+    probeHttp(port).then((r) => {
+      const s = previewServers.get(port)
+      if (!s) return
+      s.http = s.http || r.http
+      s.title = r.title || s.title
+      if (r.http && !s.announced) {
+        s.announced = true
+        log(`preview: dashboard live at /preview/${port}/${s.title ? ` (${s.title})` : ""}`)
+      }
+    })
+  }
+  for (const port of [...previewServers.keys()]) {
+    if (!seen.has(port)) {
+      previewServers.delete(port)
+      log(`preview: server on :${port} stopped`)
+    }
+  }
+}, 2000).unref()
+
+// A request belongs to a preview when it is under /preview/<port>/ directly,
+// or when its Referer points there — absolute-path assets, fetches and HMR
+// websockets of the previewed app land on our origin and must be forwarded
+// to the dev server they came from.
+function previewTarget(req, urlPath) {
+  const direct = urlPath.match(PREVIEW_RE)
+  if (direct) return { port: Number(direct[1]), sub: direct[2] || "/" }
+  const ref = String(req.headers.referer || req.headers.referrer || "")
+  const rm = ref.match(/\/preview\/(\d{2,5})(\/|$)/)
+  if (rm) {
+    const u = new URL(req.url, "http://x")
+    return { port: Number(rm[1]), sub: u.pathname + u.search }
+  }
+  return null
+}
+
+function proxyPreview(req, res, port, sub) {
+  const headers = {}
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (HOP_BY_HOP.has(name.toLowerCase())) continue
+    headers[name] = value
+  }
+  headers.host = `127.0.0.1:${port}`
+  const upstream = http.request(
+    { hostname: "127.0.0.1", port, path: sub, method: req.method, headers },
+    (upRes) => {
+      const resHeaders = {}
+      for (const [name, value] of Object.entries(upRes.headers)) {
+        if (HOP_BY_HOP.has(name.toLowerCase())) continue
+        resHeaders[name] = value
+      }
+      res.writeHead(upRes.statusCode || 502, resHeaders)
+      upRes.pipe(res)
+    },
+  )
+  upstream.on("error", (err) => {
+    if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain; charset=utf-8" })
+    res.end(`preview :${port} not responding (${String((err && err.message) || err)})`)
+  })
+  req.pipe(upstream)
+  req.on("aborted", () => upstream.destroy())
+}
+
+// WebSocket upgrades for the preview (Vite/Next HMR and friends).
+function proxyPreviewUpgrade(req, socket, head, port, sub) {
+  const headers = { ...req.headers }
+  headers.host = `127.0.0.1:${port}`
+  delete headers.connection
+  const lines = [
+    `${req.method} ${sub} HTTP/1.1`,
+    ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`),
+    "\r\n",
+  ]
+  const upstream = net.connect(port, "127.0.0.1", () => {
+    upstream.write(lines.join("\r\n"))
+    if (head && head.length) upstream.write(head)
+    upstream.pipe(socket)
+    socket.pipe(upstream)
+  })
+  upstream.on("error", () => {
+    socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+  })
+  socket.on("error", () => upstream.destroy())
+  socket.on("close", () => upstream.destroy())
+}
+
+// ---------------------------------------------------------------------------
 // Engine-state persistence (deploy-time snapshot / restore)
 //
 // Engine state lives under DATA_DIR (the /data volume: legacy xdg/ plus every
@@ -704,8 +886,189 @@ function proxyUpgrade(req, socket, head, space) {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard panel — a tiny script injected into the app's index.html
+//
+// Polls /__preview; when the agent's dev server shows up it pops a z.ai-style
+// panel on the right: dark toolbar (URL, copy, refresh, device width toggle,
+// open-in-new-tab, close) with the live app in an iframe below. Stays out of
+// the way until a server is detected.
+// ---------------------------------------------------------------------------
+
+const PREVIEW_PANEL_CSS = `
+#ocp-pill{position:fixed;right:18px;bottom:18px;z-index:2147483000;display:flex;align-items:center;gap:8px;padding:10px 15px;border-radius:999px;background:#171717;color:#e7e7e7;font:500 13px/1 system-ui,-apple-system,sans-serif;border:1px solid #2e2e2e;box-shadow:0 6px 24px rgba(0,0,0,.45);cursor:pointer;user-select:none}
+#ocp-pill:hover{background:#202020}
+.ocp-dot{width:8px;height:8px;border-radius:50%;background:#22c55e;animation:ocp-pulse 1.6s infinite}
+@keyframes ocp-pulse{0%{box-shadow:0 0 0 0 rgba(34,197,94,.5)}70%{box-shadow:0 0 0 8px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
+.ocp-off{display:none!important}
+#ocp-drawer{position:fixed;top:0;right:0;height:100vh;width:min(560px,62vw);background:#111;border-left:1px solid #2a2a2a;z-index:2147483001;transform:translateX(102%);transition:transform .22s ease;display:flex;flex-direction:column}
+#ocp-drawer.ocp-on{transform:none}
+.ocp-bar{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#1a1a1a;border-bottom:1px solid #2a2a2a;flex-wrap:wrap}
+.ocp-chips{display:flex;gap:6px;max-width:40%}
+.ocp-chip{padding:4px 10px;border-radius:8px;background:#262626;color:#d4d4d4;font:500 12px system-ui;cursor:pointer;border:1px solid transparent;white-space:nowrap;overflow:hidden;max-width:140px;text-overflow:ellipsis}
+.ocp-chip.ocp-act{background:#0f0f0f;color:#fff;border-color:#3f3f3f}
+.ocp-url{flex:1;min-width:120px;color:#a3a3a3;font:12px ui-monospace,SFMono-Regular,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+.ocp-actions{display:flex;gap:2px}
+.ocp-btn{width:30px;height:30px;border-radius:8px;border:0;background:transparent;color:#d4d4d4;font-size:15px;cursor:pointer;display:grid;place-items:center;padding:0}
+.ocp-btn:hover{background:#2a2a2a;color:#fff}
+.ocp-frame{flex:1;display:flex;justify-content:center;background:#0c0c0c;overflow:hidden}
+.ocp-frame iframe{width:100%;height:100%;border:0;background:#fff}
+.ocp-frame.ocp-narrow iframe{max-width:420px;box-shadow:0 0 0 1px #2a2a2a}
+.ocp-msg{display:none;flex:1;align-items:center;justify-content:center;color:#8a8a8a;font:14px system-ui;padding:24px;text-align:center}
+@media(max-width:640px){#ocp-drawer{width:100vw}}
+`
+
+const PREVIEW_PANEL_JS = `(function () {
+  "use strict"
+  var st = { servers: [], active: null, open: false, wide: true, lastCount: 0, dismissed: 0 }
+  var pill, drawer, chips, urlText, frameHost, iframe, msg
+  function h(tag, cls, txt) {
+    var e = document.createElement(tag)
+    if (cls) e.className = cls
+    if (txt != null) e.textContent = txt
+    return e
+  }
+  function btn(glyph, title, fn) {
+    var b = h("button", "ocp-btn", glyph)
+    b.title = title
+    b.setAttribute("aria-label", title)
+    b.addEventListener("click", fn)
+    return b
+  }
+  function activeServer() {
+    for (var i = 0; i < st.servers.length; i++) if (st.servers[i].port === st.active) return st.servers[i]
+    var best = null
+    for (var j = 0; j < st.servers.length; j++) {
+      if (!best || (st.servers[j].since || 0) > (best.since || 0)) best = st.servers[j]
+    }
+    return best
+  }
+  function activeUrl() {
+    var s = activeServer()
+    return s ? location.origin + "/preview/" + s.port + "/" : null
+  }
+  function build() {
+    var style = h("style")
+    style.id = "ocp-style"
+    style.textContent = ${JSON.stringify(PREVIEW_PANEL_CSS)}
+    document.head.appendChild(style)
+    pill = h("div")
+    pill.id = "ocp-pill"
+    pill.className = "ocp-off"
+    pill.appendChild(h("span", "ocp-dot"))
+    pill.appendChild(h("span", "", "Dashboard"))
+    pill.addEventListener("click", function () { show(true) })
+    drawer = h("div")
+    drawer.id = "ocp-drawer"
+    var bar = h("div", "ocp-bar")
+    chips = h("div", "ocp-chips")
+    urlText = h("span", "ocp-url", "")
+    urlText.title = "Open in new tab"
+    urlText.addEventListener("click", function () { var u = activeUrl(); if (u) window.open(u, "_blank") })
+    var actions = h("div", "ocp-actions")
+    actions.appendChild(btn("\\u29c9", "Copy preview URL", function () {
+      var u = activeUrl()
+      if (u && navigator.clipboard) navigator.clipboard.writeText(u).catch(function () {})
+    }))
+    actions.appendChild(btn("\\u27f3", "Refresh preview", function () {
+      try { iframe.contentWindow.location.reload() } catch (e) { if (iframe) iframe.src = iframe.src }
+    }))
+    actions.appendChild(btn("\\u25ad", "Toggle device width", function () {
+      st.wide = !st.wide
+      frameHost.classList.toggle("ocp-narrow", !st.wide)
+    }))
+    actions.appendChild(btn("\\u2197", "Open in new tab", function () {
+      var u = activeUrl(); if (u) window.open(u, "_blank")
+    }))
+    actions.appendChild(btn("\\u2715", "Close dashboard", function () {
+      show(false); st.dismissed = Date.now()
+    }))
+    bar.appendChild(chips); bar.appendChild(urlText); bar.appendChild(actions)
+    frameHost = h("div", "ocp-frame")
+    msg = h("div", "ocp-msg", "Dev server stopped \\u2014 ask the agent to start it again.")
+    drawer.appendChild(bar); drawer.appendChild(frameHost); drawer.appendChild(msg)
+    document.body.appendChild(pill)
+    document.body.appendChild(drawer)
+  }
+  function show(v) {
+    st.open = v
+    drawer.classList.toggle("ocp-on", v)
+    pill.classList.toggle("ocp-off", v)
+    if (v) ensureFrame()
+  }
+  function ensureFrame() {
+    var s = activeServer()
+    if (!s) return
+    if (!iframe) {
+      iframe = h("iframe")
+      iframe.setAttribute("allow", "forms; clipboard-write; fullscreen")
+      frameHost.appendChild(iframe)
+      iframe.dataset.port = ""
+    }
+    if (iframe.dataset.port !== String(s.port)) {
+      iframe.dataset.port = String(s.port)
+      iframe.src = location.origin + "/preview/" + s.port + "/"
+    }
+  }
+  function render() {
+    if (!drawer) build()
+    var s = activeServer()
+    var url = s ? location.origin + "/preview/" + s.port + "/" : null
+    while (chips.firstChild) chips.removeChild(chips.firstChild)
+    for (var i = 0; i < st.servers.length; i++) {
+      (function (srv) {
+        var c = h("button", "ocp-chip" + (s && srv.port === s.port ? " ocp-act" : ""), ":" + srv.port)
+        if (srv.title) c.title = srv.title
+        c.addEventListener("click", function () { st.active = srv.port; ensureFrame(); render() })
+        chips.appendChild(c)
+      })(st.servers[i])
+    }
+    urlText.textContent = url || "no dev server"
+    if (!s) {
+      frameHost.classList.add("ocp-off")
+      msg.classList.remove("ocp-off")
+      msg.style.display = "flex"
+      iframe = null
+      frameHost.innerHTML = ""
+    } else {
+      msg.style.display = "none"
+      frameHost.classList.remove("ocp-off")
+      msg.classList.add("ocp-off")
+      if (st.open) ensureFrame()
+    }
+    pill.classList.toggle("ocp-off", st.open || !st.servers.length)
+    if (st.servers.length && !st.open && st.lastCount === 0 && Date.now() - st.dismissed > 1500) show(true)
+    st.lastCount = st.servers.length
+  }
+  function poll() {
+    fetch("/__preview", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : { servers: [] } })
+      .then(function (d) { st.servers = (d && d.servers) || []; render() })
+      .catch(function () {})
+  }
+  if (document.getElementById("ocp-style")) return
+  poll()
+  setInterval(poll, 2500)
+})()`
+
+// ---------------------------------------------------------------------------
 // Static web UI (the renderer built from source)
 // ---------------------------------------------------------------------------
+
+// The app shell gets the dashboard panel script injected (dev-server preview).
+let injectedIndexCache = null
+function injectedIndex() {
+  if (injectedIndexCache) return injectedIndexCache
+  try {
+    const raw = fs.readFileSync(path.join(WEB_DIR, "index.html"), "utf8")
+    const out = raw.includes("__preview_panel.js")
+      ? raw
+      : raw.replace(/<\/body>/i, `<script src="/__preview_panel.js" defer></script></body>`)
+    injectedIndexCache = Buffer.from(out)
+    return injectedIndexCache
+  } catch {
+    return null
+  }
+}
 
 function serveStatic(req, res) {
   const urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname)
@@ -717,6 +1080,16 @@ function serveStatic(req, res) {
   const tryFile = (candidate) => {
     fs.stat(candidate, (err, stat) => {
       if (!err && stat.isFile()) {
+        if (candidate === path.join(WEB_DIR, "index.html")) {
+          const injected = injectedIndex()
+          if (injected) {
+            res.writeHead(
+              200,
+              withCookie(req, { "content-type": MIME[".html"], "content-length": injected.length, "cache-control": "no-cache" }),
+            )
+            return res.end(injected)
+          }
+        }
         const type = MIME[path.extname(candidate).toLowerCase()] || "application/octet-stream"
         res.writeHead(200, withCookie(req, { "content-type": type, "content-length": stat.size }))
         fs.createReadStream(candidate).pipe(res)
@@ -761,6 +1134,10 @@ async function serveStatus(req, res) {
             lastError: s.lastError || undefined,
           })),
         },
+        preview: [...previewServers.values()]
+          .filter((s) => s.http)
+          .sort((a, b) => a.port - b.port)
+          .map((s) => ({ port: s.port, url: `/preview/${s.port}/`, title: s.title || undefined })),
         disk,
         webDir: path.basename(WEB_DIR),
         projectDir: PROJECT_DIR,
@@ -808,6 +1185,33 @@ const server = http.createServer((req, res) => {
     return persistRestore(req, res)
   }
   if (req.url.startsWith("/__status")) return serveStatus(req, res)
+  if (req.url === "/__preview") {
+    const servers = [...previewServers.values()]
+      .filter((s) => s.http)
+      .sort((a, b) => a.port - b.port)
+      .map((s) => ({ port: s.port, url: `/preview/${s.port}/`, title: s.title || undefined, since: s.since }))
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" })
+    return res.end(JSON.stringify({ servers }))
+  }
+  if (req.url === "/__preview_panel.js") {
+    res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" })
+    return res.end(PREVIEW_PANEL_JS)
+  }
+  // Dev-server preview: direct /preview/<port>/... or any request whose
+  // Referer points at one (the previewed app's absolute-path assets, XHRs and
+  // HMR sockets). Reserved ports (ourselves, engines) are never proxied.
+  const pTarget = previewTarget(req, req.url)
+  if (pTarget) {
+    if (reservedPreviewPorts().has(pTarget.port)) {
+      res.writeHead(403, { "content-type": "text/plain; charset=utf-8" })
+      return res.end("Forbidden preview port")
+    }
+    if (previewServers.has(pTarget.port) || listeningPortOnce(pTarget.port)) {
+      return proxyPreview(req, res, pTarget.port, pTarget.sub)
+    }
+    res.writeHead(502, { "content-type": "text/plain; charset=utf-8" })
+    return res.end(`No dev server on :${pTarget.port} — ask the agent to start one.`)
+  }
   // Everything below is space-scoped: the cookie decides which engine — and
   // therefore which set of sessions — a browser talks to.
   const space = getSpace(req, res)
@@ -828,6 +1232,11 @@ const server = http.createServer((req, res) => {
 })
 
 server.on("upgrade", (req, socket, head) => {
+  // Preview websockets first (HMR), same direct/Referer rules as HTTP.
+  const pTarget = previewTarget(req, req.url)
+  if (pTarget && !reservedPreviewPorts().has(pTarget.port)) {
+    return proxyPreviewUpgrade(req, socket, head, pTarget.port, pTarget.sub)
+  }
   if (!req.url.startsWith("/api/")) {
     return socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
   }
