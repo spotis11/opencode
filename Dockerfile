@@ -9,11 +9,9 @@
 # desktop Linux package) managed by server.js, which hosts the UI and proxies
 # /api/* to the engine with server-side authentication.
 #
-# Engine state (sessions, auth, config — SQLite + JSON under opencode/) is
-# redirected to /data via XDG env vars. On running.sh the instance is
-# standard-4, so /data is the container's writable layer, and persistence
-# across deploys is handled by snapshotting /data before a deploy and
-# restoring it after (see scripts/persist-snapshot.sh).
+# Engine state (sessions, auth, config — SQLite + JSON per space) lives under
+# /data on the running.sh standard-4 instance: /data is a persistent volume,
+# so state survives deploys; /__persist/dump|restore are extra belt-and-braces.
 
 FROM oven/bun:1.3 AS build
 WORKDIR /src
@@ -32,12 +30,12 @@ WORKDIR /app
 # OPENCODE_PROJECT_DIR, and everything installed here is available to it.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl wget binutils xz-utils zstd unzip zip file \
+      ca-certificates curl wget binutils xz-utils unzip zip file \
       git openssh-client \
       python3 python3-pip python3-venv \
       build-essential pkg-config \
       ripgrep jq sqlite3 \
-      net-tools procps less man-db nano \
+      net-tools procps less man-db nano htop tree \
  && rm -rf /var/lib/apt/lists/* \
  && git config --system user.name "opencode-sandbox" \
  && git config --system user.email "opencode@localhost" \
@@ -51,35 +49,19 @@ RUN curl -fsSL -o /tmp/opencode.deb https://opencode.ai/files/bin/2.4.2/opencode
  && for f in /tmp/data.tar.*; do tar -xf "$f" -C /tmp/oc; done \
  && install -m 0755 "$(find /tmp/oc -type f -name opencode-cli | head -1)" /app/engine/opencode \
  && rm -rf /tmp/oc /tmp/opencode.deb /tmp/data.tar.* /tmp/control.tar.* /tmp/debian-binary
-# Local models: Ollama runs inside this container (CPU-only — the GPU backend
-# libraries are stripped to keep the image small). The image stays lean by
-# NOT baking the weights in: entrypoint.sh pulls them on first boot into
-# /var/lib/ollama/models. That is the container's main disk (~18 GB free) —
-# /data, by contrast, is only a 1 GB persistent volume (engine state), which
-# models would blow through instantly. No provider meters any usage.
-RUN curl -fsSL -o /tmp/ollama.tar.zst https://github.com/ollama/ollama/releases/download/v0.40.18/ollama-linux-amd64.tar.zst \
- && mkdir -p /tmp/ol \
- && tar -x --zstd -f /tmp/ollama.tar.zst -C /tmp/ol \
- && install -m 0755 /tmp/ol/bin/ollama /usr/local/bin/ollama \
- && mkdir -p /usr/local/lib \
- && cp -a /tmp/ol/lib/ollama /usr/local/lib/ollama \
- && rm -rf /usr/local/lib/ollama/cuda* /tmp/ol /tmp/ollama.tar.zst
-ENV OLLAMA_HOST=127.0.0.1:11434 \
-    OLLAMA_MODELS=/var/lib/ollama/models \
-    OLLAMA_MAX_LOADED_MODELS=1 \
-    OLLAMA_NUM_PARALLEL=1 \
-    OLLAMA_CONTEXT_LENGTH=16384 \
-    OLLAMA_KEEP_ALIVE=10m
+# fastfetch — the sandbox's "specs" command: ask any AI model in the app to
+# run fastfetch and it executes right here, showing this box's real CPU,
+# RAM and Debian release. Not in Debian bookworm's repos yet, so use the
+# official release .deb.
+RUN curl -fsSL -o /tmp/fastfetch.deb https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-amd64.deb \
+ && apt-get install -y --no-install-recommends /tmp/fastfetch.deb \
+ && rm -f /tmp/fastfetch.deb
 COPY --from=build /src/packages/app/dist /app/web
 COPY server.js /app/server.js
-COPY entrypoint.sh /app/entrypoint.sh
 ENV HOST=0.0.0.0 \
     PORT=8080 \
-    OPENCODE_PROJECT_DIR=/workspace \
-    XDG_DATA_HOME=/data/xdg/data \
-    XDG_CONFIG_HOME=/data/xdg/config \
-    XDG_CACHE_HOME=/tmp/xdg/cache
-RUN mkdir -p /workspace /data/xdg/data /data/xdg/config /var/lib/ollama/models /tmp/xdg/cache \
- && printf '# Welcome to your OpenCode sandbox\n\nA real Linux box for coding: python3, git, gcc/g++, make and the usual shell tools are installed. Try `python3 -V` in shell mode.\n' > /workspace/README.md
+    OPENCODE_PROJECT_DIR=/workspace
+RUN mkdir -p /workspace /data/xdg /data/spaces /tmp/xdg/cache \
+ && printf '# Welcome to your OpenCode sandbox\n\nA full Debian Linux box for coding: python3, git, gcc/g++, make, ripgrep, jq, htop, tree and fastfetch are installed — ask the AI to run `fastfetch` to see this machine'"'"'s specs. Every browser gets its own private space: the sessions you see here are yours alone.\n' > /workspace/README.md
 EXPOSE 8080
-CMD ["/bin/sh", "/app/entrypoint.sh"]
+CMD ["node", "/app/server.js"]
